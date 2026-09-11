@@ -372,6 +372,83 @@ WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM SYNC_RUN_HEADER);
 
 
 --------------------------------------------------------------------------------
+-- TEST 15 — Decouverte automatique des tables (SYNC_TABLE_CONFIG vide)
+--
+-- ATTENTION : ce test est DESTRUCTIF pour la configuration — il vide
+-- SYNC_TABLE_CONFIG (et par cascade SYNC_COLUMN_CONFIG, SYNC_KEY_CONFIG)
+-- pour observer la decouverte automatique, puis restaure une configuration
+-- manuelle equivalente a celle du Script 5 en fin de test. A executer EN
+-- DERNIER, jamais entre deux autres tests de ce script.
+--------------------------------------------------------------------------------
+BEGIN
+    TEST_HEADER(15, 'Decouverte automatique quand SYNC_TABLE_CONFIG est vide');
+END;
+/
+
+DELETE FROM SYNC_TABLE_CONFIG;  -- cascade sur SYNC_COLUMN_CONFIG et SYNC_KEY_CONFIG
+COMMIT;
+
+SELECT 'Test 15 - Configuration bien vide avant le run ?' AS verif, COUNT(*) AS resultat
+FROM SYNC_TABLE_CONFIG;
+
+DECLARE
+    v_run_id NUMBER;
+BEGIN
+    PKG_SCHEMA_SYNC.SYNC_ALL(p_dry_run => FALSE, p_run_id => v_run_id);
+    DBMS_OUTPUT.PUT_LINE('Run ID (decouverte automatique) : ' || v_run_id);
+END;
+/
+
+SELECT 'Test 15 - Tables auto-decouvertes' AS verif, TABLE_NAME, SYNC_DIRECTION, CONFLICT_STRATEGY, UPDATED_BY
+FROM SYNC_TABLE_CONFIG ORDER BY TABLE_NAME;
+
+SELECT 'Test 15 - Toutes marquees AUTO_DISCOVERY ?' AS verif,
+       COUNT(*) AS total_tables,
+       SUM(CASE WHEN UPDATED_BY = 'AUTO_DISCOVERY' THEN 1 ELSE 0 END) AS auto_decouvertes
+FROM SYNC_TABLE_CONFIG;
+
+SELECT 'Test 15 - CLIENT synchronisee malgre configuration vide au depart ?' AS verif, STATUS
+FROM SYNC_LOG WHERE TABLE_NAME = 'CLIENT' ORDER BY START_DATE DESC FETCH FIRST 1 ROW ONLY;
+
+-- Point d'attention pedagogique : si LOG_EVENEMENT (creee au Test 9) existe
+-- encore des deux cotes, elle est elle aussi auto-decouverte ici — mais sa
+-- cle manuelle (SYNC_KEY_CONFIG) a ete perdue par la cascade du DELETE
+-- ci-dessus. Elle devrait donc apparaitre EXCLUDED / BLOCKING (PK_MISSING)
+-- dans SYNC_COMPATIBILITY_REPORT pour ce run : la decouverte automatique ne
+-- devine jamais de cle, elle se contente de lister les tables communes.
+SELECT 'Test 15 - LOG_EVENEMENT (si presente) exclue faute de cle ?' AS verif,
+       TABLE_NAME, ISSUE_TYPE, SEVERITY
+FROM SYNC_COMPATIBILITY_REPORT
+WHERE TABLE_NAME = 'LOG_EVENEMENT' AND SEVERITY = 'BLOCKING'
+ORDER BY CHECK_DATE DESC FETCH FIRST 1 ROW ONLY;
+
+--------------------------------------------------------------------------------
+-- Restauration de la configuration manuelle (equivalente au Script 5), pour
+-- ne pas laisser l'environnement dans un etat purement auto-decouvert si
+-- l'exploitation doit se poursuivre apres ce jeu de tests.
+--------------------------------------------------------------------------------
+DELETE FROM SYNC_TABLE_CONFIG;  -- purge la config auto-decouverte (cascade incluse)
+COMMIT;
+
+INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
+VALUES ('CLIENT', 'Y', 'BIDIRECTIONAL', 'SOURCE_A_WINS', 10);
+INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
+VALUES ('PRODUIT', 'Y', 'BIDIRECTIONAL', 'ERROR_ON_CONFLICT', 10);
+INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
+VALUES ('COMMANDE', 'Y', 'BIDIRECTIONAL', 'SOURCE_A_WINS', 20);
+INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
+VALUES ('COMMANDE_LIGNE', 'Y', 'BIDIRECTIONAL', 'SOURCE_A_WINS', 20);
+INSERT INTO SYNC_COLUMN_CONFIG (TABLE_NAME, COLUMN_NAME, SYNC_ENABLED)
+VALUES ('CLIENT', 'DATE_CREATION', 'N');
+COMMIT;
+
+-- NOTE : si le Test 9 (table sans PK, LOG_EVENEMENT) doit rester actif au-delà
+-- de ce script, ré-exécuter aussi son insertion SYNC_TABLE_CONFIG et son
+-- SYNC_KEY_CONFIG (CODE_EVT) — non repris ici automatiquement, la restauration
+-- ci-dessus ne couvre que le socle du Script 5.
+
+
+--------------------------------------------------------------------------------
 -- Nettoyage de l'utilitaire de test (optionnel)
 --------------------------------------------------------------------------------
 -- DROP PROCEDURE TEST_HEADER;
