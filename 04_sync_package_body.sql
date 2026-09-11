@@ -858,38 +858,47 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                             p_cluster_meta(v_meta_idx).excluded          := FALSE;
 
                             -- Traçabilité même en cas d'acceptation : un cycle, même
-                            -- déferrable, reste une situation à surveiller.
-                            insert_compat_report(
-                                p_check_id      => p_check_id,
-                                p_table_name    => v_cycle_msg,
-                                p_column_name   => NULL,
-                                p_issue_type    => 'FK_CYCLE_NOT_DEFERRABLE',  -- réutilisée comme marqueur générique
-                                                                                -- "cycle FK détecté" ; la sévérité
-                                                                                -- WARNING (ci-dessous) distingue le cas
-                                                                                -- accepté (déférable) du cas BLOCKING
-                                                                                -- (non déférable, cf. branche ELSE)
-                                p_severity      => C_SEVERITY_WARNING,
-                                p_detail_a      => 'Cycle deferrable, contraintes differees pour ce run',
-                                p_detail_b      => NULL
-                            );
+                            -- déferrable, reste une situation à surveiller. Une ligne
+                            -- PAR TABLE du cycle (et non une ligne unique avec la liste
+                            -- concaténée en TABLE_NAME, qui risquerait ORA-12899 dès que
+                            -- le cycle comporte plusieurs tables aux noms un peu longs :
+                            -- TABLE_NAME est VARCHAR2(128) et n'est prévue que pour UN nom).
+                            FOR i IN 1 .. v_m_count LOOP
+                                IF NOT is_in_list(v_members(i), v_resolved) THEN
+                                    insert_compat_report(
+                                        p_check_id      => p_check_id,
+                                        p_table_name    => v_members(i),
+                                        p_column_name   => NULL,
+                                        p_issue_type    => 'FK_CYCLE_NOT_DEFERRABLE',
+                                        p_severity      => C_SEVERITY_WARNING,
+                                        p_detail_a      => 'Cycle deferrable accepte, contraintes differees pour ce run. Membres du cycle : ' || v_cycle_msg,
+                                        p_detail_b      => NULL
+                                    );
+                                END IF;
+                            END LOOP;
                         ELSE
                             p_cluster_meta(v_meta_idx).requires_deferred := FALSE;
                             p_cluster_meta(v_meta_idx).excluded          := TRUE;
                             p_cluster_meta(v_meta_idx).exclusion_reason  :=
                                 'Cycle FK non deferrable detecte parmi : ' || v_cycle_msg;
 
-                            -- Persistance de l'exclusion (corrige un oubli : sans cet appel,
-                            -- seule la structure en mémoire du run courant connaissait la
-                            -- raison de l'exclusion, perdue après le run).
-                            insert_compat_report(
-                                p_check_id      => p_check_id,
-                                p_table_name    => v_cycle_msg,
-                                p_column_name   => NULL,
-                                p_issue_type    => 'FK_CYCLE_NOT_DEFERRABLE',
-                                p_severity      => C_SEVERITY_BLOCKING,
-                                p_detail_a      => p_cluster_meta(v_meta_idx).exclusion_reason,
-                                p_detail_b      => NULL
-                            );
+                            -- Persistance de l'exclusion (corrige un oubli précédent : sans
+                            -- ceci, seule la structure en mémoire du run courant connaissait
+                            -- la raison de l'exclusion, perdue après le run). Une ligne PAR
+                            -- TABLE du cycle, même raison que ci-dessus (ORA-12899 évité).
+                            FOR i IN 1 .. v_m_count LOOP
+                                IF NOT is_in_list(v_members(i), v_resolved) THEN
+                                    insert_compat_report(
+                                        p_check_id      => p_check_id,
+                                        p_table_name    => v_members(i),
+                                        p_column_name   => NULL,
+                                        p_issue_type    => 'FK_CYCLE_NOT_DEFERRABLE',
+                                        p_severity      => C_SEVERITY_BLOCKING,
+                                        p_detail_a      => p_cluster_meta(v_meta_idx).exclusion_reason,
+                                        p_detail_b      => NULL
+                                    );
+                                END IF;
+                            END LOOP;
                         END IF;
                     END IF;
                 END;
