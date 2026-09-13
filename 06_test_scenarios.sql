@@ -230,7 +230,7 @@ DECLARE
     v_blocking BOOLEAN;
 BEGIN
     -- Sans SYNC_KEY_CONFIG : doit produire une anomalie PK_MISSING BLOCKING
-    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY('LOG_EVENEMENT', v_check_id, v_blocking);
+    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => 'LOG_EVENEMENT', p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
     DBMS_OUTPUT.PUT_LINE('Sans cle configuree -> blocking = ' ||
         CASE WHEN v_blocking THEN 'TRUE (attendu)' ELSE 'FALSE (inattendu !)' END);
 END;
@@ -244,7 +244,7 @@ DECLARE
     v_check_id NUMBER;
     v_blocking BOOLEAN;
 BEGIN
-    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY('LOG_EVENEMENT', v_check_id, v_blocking);
+    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => 'LOG_EVENEMENT', p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
     DBMS_OUTPUT.PUT_LINE('Avec cle configuree -> blocking = ' ||
         CASE WHEN v_blocking THEN 'TRUE (verifier unicite reelle des donnees !)' ELSE 'FALSE (attendu)' END);
 END;
@@ -270,7 +270,7 @@ DECLARE
     v_check_id NUMBER;
     v_blocking BOOLEAN;
 BEGIN
-    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY('CLIENT', v_check_id, v_blocking);
+    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => 'CLIENT', p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
     DBMS_OUTPUT.PUT_LINE('CLIENT incompatible -> blocking = ' || CASE WHEN v_blocking THEN 'TRUE (attendu)' ELSE 'FALSE' END);
 END;
 /
@@ -446,6 +446,71 @@ COMMIT;
 -- de ce script, ré-exécuter aussi son insertion SYNC_TABLE_CONFIG et son
 -- SYNC_KEY_CONFIG (CODE_EVT) — non repris ici automatiquement, la restauration
 -- ci-dessus ne couvre que le socle du Script 5.
+
+
+--------------------------------------------------------------------------------
+-- TEST 16 — Configuration du DB LINK à l'exécution (SET_DB_LINK / GET_DB_LINK)
+--
+-- Démontre que la valeur du DB LINK peut être consultée et modifiée sans
+-- recompilation, via SET_DB_LINK/GET_DB_LINK ou le paramètre p_db_link de
+-- SYNC_ALL/SYNC_TABLE/CHECK_COMPATIBILITY.
+--------------------------------------------------------------------------------
+BEGIN
+    TEST_HEADER(16, 'Configuration du DB LINK a l''execution (sans recompilation)');
+END;
+/
+
+DECLARE
+    v_current VARCHAR2(128);
+BEGIN
+    v_current := PKG_SCHEMA_SYNC.GET_DB_LINK;
+    DBMS_OUTPUT.PUT_LINE('DB LINK actuellement actif (valeur compilee ou deja fixee) : ' ||
+        NVL(v_current, '<NULL - meme instance>'));
+
+    -- Round-trip : refixer explicitement la meme valeur via SET_DB_LINK et
+    -- verifier que GET_DB_LINK la reflete bien.
+    PKG_SCHEMA_SYNC.SET_DB_LINK(v_current);
+    IF NVL(PKG_SCHEMA_SYNC.GET_DB_LINK, '<NULL>') = NVL(v_current, '<NULL>') THEN
+        DBMS_OUTPUT.PUT_LINE('OK - SET_DB_LINK/GET_DB_LINK coherents apres round-trip.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('ANOMALIE - valeur apres SET_DB_LINK differente de celle attendue.');
+    END IF;
+END;
+/
+
+-- Un appel SYNC_TABLE sans p_db_link (valeur par defaut = sentinelle
+-- C_DB_LINK_KEEP_CURRENT) ne doit RIEN changer a la configuration courante :
+DECLARE
+    v_before  VARCHAR2(128) := PKG_SCHEMA_SYNC.GET_DB_LINK;
+    v_after   VARCHAR2(128);
+    v_run_id  NUMBER;
+BEGIN
+    PKG_SCHEMA_SYNC.SYNC_TABLE('CLIENT', p_dry_run => TRUE, p_run_id => v_run_id);
+    v_after := PKG_SCHEMA_SYNC.GET_DB_LINK;
+    IF NVL(v_before, '<NULL>') = NVL(v_after, '<NULL>') THEN
+        DBMS_OUTPUT.PUT_LINE('OK - appel sans p_db_link : configuration inchangee.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('ANOMALIE - la configuration a change sans que p_db_link soit fourni.');
+    END IF;
+END;
+/
+
+-- A l'inverse, passer p_db_link explicitement (meme avec la valeur deja
+-- active) doit fonctionner sans erreur, et modifier reellement la valeur
+-- si elle differe (a adapter avec un second DB LINK reel si disponible
+-- dans l'environnement de test, pour valider un vrai changement de cible) :
+DECLARE
+    v_run_id NUMBER;
+BEGIN
+    PKG_SCHEMA_SYNC.SYNC_TABLE(
+        p_table_name => 'CLIENT',
+        p_dry_run    => TRUE,
+        p_db_link    => PKG_SCHEMA_SYNC.GET_DB_LINK,  -- reaffirme la valeur courante
+        p_run_id     => v_run_id
+    );
+    DBMS_OUTPUT.PUT_LINE('OK - appel avec p_db_link explicite accepte (run ' || v_run_id || ').');
+END;
+/
 
 
 --------------------------------------------------------------------------------

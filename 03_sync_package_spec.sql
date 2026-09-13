@@ -4,7 +4,10 @@
 --
 -- Rappel des décisions d'architecture qui conditionnent cette spécification :
 --   - SCHEMA_A = schéma local (même instance que SYNC_ADMIN, via synonymes/grants)
---   - SCHEMA_B = schéma distant, accédé exclusivement via le DB LINK SYNC_LINK_B
+--   - SCHEMA_B = accédé via le DB LINK SYNC_LINK_B s'il est sur une instance
+--     distincte, ou directement en local (grants directs, sans DB LINK) si
+--     SCHEMA_A et SCHEMA_B partagent la même instance (C_DB_LINK_B = NULL
+--     dans ce second cas, cf. section "Constantes d'environnement")
 --   - Ces deux points d'ancrage sont FIXES (pas de paramètre p_schema_a/p_schema_b
 --     à l'appel : cf. décision validée, évite qu'un appelant redirige
 --     accidentellement la synchro vers d'autres schémas). Le nom exact des
@@ -29,7 +32,44 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --------------------------------------------------------------------------
     C_SCHEMA_A          CONSTANT VARCHAR2(128) := 'SCHEMA_A';
     C_SCHEMA_B          CONSTANT VARCHAR2(128) := 'SCHEMA_B';
-    C_DB_LINK_B         CONSTANT VARCHAR2(128) := 'SYNC_LINK_B';
+
+    -- C_DB_LINK_B : valeur PAR DEFAUT du nom de DB LINK utilisé pour accéder
+    -- à SCHEMA_B, appliquée à l'initialisation de chaque session (cf. section
+    -- d'initialisation en fin de PACKAGE BODY). Cette valeur par défaut reste
+    -- un paramètre de compilation (modifier le comportement "par défaut"
+    -- suppose toujours une ré-installation), MAIS elle peut désormais être
+    -- SURCHARGEE A L'EXECUTION, sans recompilation, via :
+    --   - PKG_SCHEMA_SYNC.SET_DB_LINK(p_db_link) : valable pour le reste de
+    --     la SESSION Oracle courante (variable de package, pas une table) ;
+    --   - le paramètre p_db_link, optionnel, de SYNC_ALL / SYNC_TABLE /
+    --     CHECK_COMPATIBILITY : équivalent à un appel SET_DB_LINK juste avant,
+    --     pratique pour un ajustement ponctuel en un seul appel.
+    --   - Renseigner un nom (ex. 'SYNC_LINK_B') si SCHEMA_A et SCHEMA_B sont
+    --     sur DEUX INSTANCES DISTINCTES.
+    --   - NULL si SCHEMA_A et SCHEMA_B sont sur LA MÊME instance : toutes les
+    --     références à SCHEMA_B en SQL dynamique omettent alors le suffixe
+    --     '@...' (cf. fonctions privées b_link_suffix / b_table_ref dans le
+    --     corps du package). SYNC_ADMIN doit dans ce cas disposer de grants
+    --     locaux directs sur SCHEMA_B, exactement comme sur SCHEMA_A.
+    --     Bénéfice induit : plus aucune transaction distribuée (2PC) ni
+    --     risque de session in-doubt, la grappe entière restant purement
+    --     locale à l'instance.
+    -- ATTENTION (portée session) : SET_DB_LINK modifie une variable de
+    -- package, dont la durée de vie est celle de la SESSION Oracle (pas de
+    -- l'appel). Sur un pool de connexions partagé entre plusieurs contextes
+    -- logiques, un SET_DB_LINK effectué par un appelant reste actif pour les
+    -- appels suivants dans la MEME session tant qu'il n'est pas changé à
+    -- nouveau — comportement voulu (le configurer une fois, pas à chaque
+    -- appel), mais à garder en tête dans ce cas de figure.
+    C_DB_LINK_B         CONSTANT VARCHAR2(128) := 'SYNC_LINK_B';  -- ou NULL si même instance
+
+    -- Sentinelle utilisée comme valeur par défaut du paramètre p_db_link de
+    -- SYNC_ALL / SYNC_TABLE / CHECK_COMPATIBILITY. Nécessaire car NULL a déjà
+    -- un sens fonctionnel ("pas de DB LINK, même instance") : il faut donc un
+    -- marqueur DISTINCT de NULL pour représenter "paramètre non renseigné,
+    -- ne rien changer à la valeur courante". Ne jamais utiliser cette chaîne
+    -- comme nom de DB LINK réel (improbable, mais à éviter explicitement).
+    C_DB_LINK_KEEP_CURRENT  CONSTANT VARCHAR2(30) := '$$KEEP_CURRENT_DB_LINK$$';
 
     --------------------------------------------------------------------------
     -- CONSTANTES FONCTIONNELLES
@@ -116,6 +156,39 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --------------------------------------------------------------------------
 
     ----------------------------------------------------------------------
+    -- SET_DB_LINK
+    --
+    -- Rôle : définit, pour le reste de la SESSION Oracle courante, le nom du
+    -- DB LINK utilisé pour accéder à SCHEMA_B — sans recompilation du
+    -- package. Remplace la valeur par défaut C_DB_LINK_B tant que la session
+    -- reste ouverte ou qu'un nouvel appel à SET_DB_LINK ne la change pas.
+    --
+    -- Paramètres :
+    --   p_db_link : nom du DB LINK à utiliser (ex. 'SYNC_LINK_B_TEST'), ou
+    --               NULL pour forcer explicitement le mode "même instance"
+    --               (aucun DB LINK, accès local direct à SCHEMA_B).
+    --
+    -- A appeler une seule fois en début de session/job avant tout SYNC_ALL /
+    -- SYNC_TABLE / CHECK_COMPATIBILITY si la valeur par défaut C_DB_LINK_B
+    -- ne convient pas pour cet environnement. Sans appel à SET_DB_LINK (ni
+    -- p_db_link renseigné sur les appels ci-dessous), la valeur compilée
+    -- C_DB_LINK_B s'applique.
+    ----------------------------------------------------------------------
+    PROCEDURE SET_DB_LINK (
+        p_db_link IN VARCHAR2
+    );
+
+    ----------------------------------------------------------------------
+    -- GET_DB_LINK
+    --
+    -- Rôle : retourne la valeur ACTUELLEMENT active (pour la session en
+    -- cours) du nom de DB LINK utilisé pour accéder à SCHEMA_B — NULL si le
+    -- mode "même instance" est actif. Utile pour vérifier l'état courant
+    -- avant un appel, ou à des fins de diagnostic/test.
+    ----------------------------------------------------------------------
+    FUNCTION GET_DB_LINK RETURN VARCHAR2;
+
+    ----------------------------------------------------------------------
     -- SYNC_ALL
     --
     -- Synchronise toutes les tables actives de SYNC_TABLE_CONFIG
@@ -133,6 +206,14 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --                   traitement des grappes suivantes ; les grappes déjà
     --                   commitées AVANT l'échec restent commitées (pas de
     --                   rollback global).
+    --   p_db_link     : optionnel. Si renseigné (différent de la sentinelle
+    --                   C_DB_LINK_KEEP_CURRENT), équivaut à appeler
+    --                   SET_DB_LINK(p_db_link) juste avant ce run — pratique
+    --                   pour un ajustement ponctuel en un seul appel plutôt
+    --                   que deux. Laissé à sa valeur par défaut, la valeur
+    --                   actuellement définie pour la session (C_DB_LINK_B
+    --                   par défaut, ou toute valeur déjà fixée par un appel
+    --                   SET_DB_LINK précédent) s'applique sans changement.
     --   p_run_id      : identifiant du run généré (SYNC_RUN_ID_SEQ), à
     --                   utiliser ensuite avec GET_RUN_STATUS.
     --
@@ -144,6 +225,7 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     PROCEDURE SYNC_ALL (
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
         p_error_mode    IN  VARCHAR2 DEFAULT C_ERROR_MODE_CONTINUE,
+        p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_run_id        OUT NUMBER
     );
 
@@ -165,10 +247,14 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --
     -- Lève E_TABLE_NOT_CONFIGURED si p_table_name n'existe pas dans
     -- SYNC_TABLE_CONFIG ou y est désactivée.
+    --
+    -- p_db_link : cf. SYNC_ALL — optionnel, override ponctuel équivalent à
+    -- SET_DB_LINK(p_db_link) avant ce run.
     ----------------------------------------------------------------------
     PROCEDURE SYNC_TABLE (
         p_table_name    IN  VARCHAR2,
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
+        p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_run_id        OUT NUMBER
     );
 
@@ -191,9 +277,13 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- p_has_blocking_issues : sortie pratique pour un appel isolé (hors
     -- SYNC_ALL), évite à l'appelant de requêter SYNC_COMPATIBILITY_REPORT
     -- juste pour savoir s'il peut lancer une synchronisation en confiance.
+    --
+    -- p_db_link : cf. SYNC_ALL — optionnel, override ponctuel équivalent à
+    -- SET_DB_LINK(p_db_link) avant ce contrôle.
     ----------------------------------------------------------------------
     PROCEDURE CHECK_COMPATIBILITY (
         p_table_name            IN  VARCHAR2 DEFAULT NULL,
+        p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_check_id              OUT NUMBER,
         p_has_blocking_issues   OUT BOOLEAN
     );

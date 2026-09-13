@@ -95,6 +95,23 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     --------------------------------------------------------------------------
+    -- VARIABLE DE PACKAGE (état de session)
+    --
+    -- g_db_link_b : valeur EFFECTIVE, pour la session Oracle courante, du nom
+    -- de DB LINK utilisé pour accéder à SCHEMA_B (NULL = même instance,
+    -- accès local direct). Initialisée à C_DB_LINK_B (valeur compilée) par
+    -- la section d'initialisation du package body (tout en bas de ce
+    -- fichier), puis modifiable à l'exécution via SET_DB_LINK ou le
+    -- paramètre p_db_link de SYNC_ALL/SYNC_TABLE/CHECK_COMPATIBILITY — sans
+    -- aucune recompilation. C'est CETTE variable que tout le reste du corps
+    -- du package doit référencer, JAMAIS directement la constante
+    -- C_DB_LINK_B (qui ne représente plus que la valeur par défaut au
+    -- démarrage de la session).
+    --------------------------------------------------------------------------
+    g_db_link_b VARCHAR2(128) := C_DB_LINK_B;
+
+
+    --------------------------------------------------------------------------
     -- sanitize_ident
     --
     -- Rôle    : point de passage OBLIGATOIRE pour tout identifiant (nom de
@@ -128,6 +145,105 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 'Identifiant SQL invalide ou potentiellement dangereux : [' || p_ident || ']'
             );
     END sanitize_ident;
+
+
+    --------------------------------------------------------------------------
+    -- SET_DB_LINK  (procédure publique)
+    --
+    -- Rôle : permet de fixer g_db_link_b à l'exécution, sans recompilation.
+    --        Cf. spécification (Script 3) pour la portée "session" de cet
+    --        effet. Aucune validation de contenu autre que sanitize_ident,
+    --        appliquée plus loin au moment de l'usage (b_link_suffix) plutôt
+    --        qu'ici : SET_DB_LINK(NULL) doit rester possible sans lever
+    --        d'erreur (NULL est une valeur valide, "même instance").
+    --------------------------------------------------------------------------
+    PROCEDURE SET_DB_LINK (p_db_link IN VARCHAR2) IS
+    BEGIN
+        g_db_link_b := p_db_link;
+    END SET_DB_LINK;
+
+
+    --------------------------------------------------------------------------
+    -- GET_DB_LINK  (procédure publique)
+    --------------------------------------------------------------------------
+    FUNCTION GET_DB_LINK RETURN VARCHAR2 IS
+    BEGIN
+        RETURN g_db_link_b;
+    END GET_DB_LINK;
+
+
+    --------------------------------------------------------------------------
+    -- apply_db_link_override
+    --
+    -- Rôle : petite fonction utilitaire privée appelée en tête de SYNC_ALL /
+    --        SYNC_TABLE / CHECK_COMPATIBILITY : si l'appelant a renseigné
+    --        p_db_link (valeur différente de la sentinelle
+    --        C_DB_LINK_KEEP_CURRENT), applique SET_DB_LINK avec cette
+    --        valeur ; sinon ne touche pas à g_db_link_b (garde la valeur de
+    --        session en cours, elle-même initialisée à C_DB_LINK_B par
+    --        défaut).
+    --------------------------------------------------------------------------
+    PROCEDURE apply_db_link_override(p_db_link IN VARCHAR2) IS
+    BEGIN
+        -- Attention NULL : "p_db_link != C_DB_LINK_KEEP_CURRENT" seul vaudrait
+        -- NULL (donc FALSE dans un IF) quand l'appelant passe explicitement
+        -- NULL pour forcer le mode "même instance" — l'override serait alors
+        -- silencieusement ignoré, laissant g_db_link_b sur son ancienne
+        -- valeur. D'où le test IS NULL explicite en première branche.
+        IF p_db_link IS NULL OR p_db_link != C_DB_LINK_KEEP_CURRENT THEN
+            SET_DB_LINK(p_db_link);
+        END IF;
+    END apply_db_link_override;
+
+
+    --------------------------------------------------------------------------
+    -- b_link_suffix
+    --
+    -- Rôle : centralise la décision "faut-il qualifier les références à
+    --        SCHEMA_B par @g_db_link_b ?". Point de configuration unique,
+    --        modifiable à l'exécution (cf. SET_DB_LINK ci-dessus) :
+    --        - SCHEMA_A et SCHEMA_B sur deux instances distinctes ->
+    --          g_db_link_b renseigné (ex. 'SYNC_LINK_B') -> suffixe '@...'
+    --          ajouté partout où SCHEMA_B est référencé en SQL dynamique.
+    --        - SCHEMA_A et SCHEMA_B sur LA MÊME instance -> g_db_link_b à
+    --          NULL -> aucun suffixe : SYNC_ADMIN doit alors disposer de
+    --          grants locaux directs sur SCHEMA_B (SELECT/INSERT/UPDATE),
+    --          exactement comme pour SCHEMA_A.
+    -- Risque évité : ne JAMAIS appeler sanitize_ident(g_db_link_b) quand
+    --        g_db_link_b est NULL — DBMS_ASSERT.SIMPLE_SQL_NAME lève une
+    --        exception sur une entrée NULL (ORA-44003), d'où le test
+    --        IS NOT NULL avant tout appel.
+    -- Effet de bord notable (documenté, pas géré par ce package) : en mode
+    --        "même instance" (g_db_link_b NULL), les transactions couvrant
+    --        les deux schémas restent purement LOCALES : le risque de
+    --        transaction distribuée (2PC) et de sessions in-doubt, qui
+    --        n'existe qu'à travers un DB LINK, disparaît de fait.
+    --------------------------------------------------------------------------
+    FUNCTION b_link_suffix RETURN VARCHAR2 IS
+    BEGIN
+        IF g_db_link_b IS NULL THEN
+            RETURN NULL;
+        END IF;
+        RETURN '@' || sanitize_ident(g_db_link_b);
+    END b_link_suffix;
+
+
+    --------------------------------------------------------------------------
+    -- b_table_ref
+    --
+    -- Rôle : raccourci pour construire la référence complète et sécurisée
+    --        d'une table côté SCHEMA_B ("SCHEMA_B.TABLE" ou
+    --        "SCHEMA_B.TABLE@SYNC_LINK_B" selon le mode d'installation),
+    --        utilisé partout où le corps du package référence une table de
+    --        SCHEMA_B dans du SQL dynamique. Remplace la construction
+    --        manuelle répétée "sanitize_ident(C_SCHEMA_B) || '.' || v_table
+    --        || '@' || sanitize_ident(C_DB_LINK_B)" qui supposait à tort un
+    --        DB LINK toujours présent.
+    --------------------------------------------------------------------------
+    FUNCTION b_table_ref(p_table_name IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN sanitize_ident(C_SCHEMA_B) || '.' || sanitize_ident(p_table_name) || b_link_suffix;
+    END b_table_ref;
 
 
     --------------------------------------------------------------------------
@@ -314,7 +430,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                     ' non unique en pratique cote SCHEMA_A.'
                 );
             END IF;
-            IF NOT validate_key_uniqueness(p_table_name, v_key, C_SCHEMA_B, C_DB_LINK_B) THEN
+            IF NOT validate_key_uniqueness(p_table_name, v_key, C_SCHEMA_B, g_db_link_b) THEN
                 RAISE_APPLICATION_ERROR(
                     -20004,
                     'Cle configuree pour ' || p_table_name ||
@@ -354,7 +470,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             '       b.data_type, b.data_length, b.data_precision, b.data_scale, b.nullable, b.data_type_owner ' ||
             'FROM (SELECT * FROM ALL_TAB_COLUMNS WHERE owner = :owner_a AND table_name = :tbl) a ' ||
             'FULL OUTER JOIN ' ||
-            '     (SELECT * FROM ALL_TAB_COLUMNS@' || sanitize_ident(C_DB_LINK_B) ||
+            '     (SELECT * FROM ALL_TAB_COLUMNS' || b_link_suffix ||
             '      WHERE owner = :owner_b AND table_name = :tbl2) b ' ||
             'ON a.column_name = b.column_name';
 
@@ -470,6 +586,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --------------------------------------------------------------------------
     PROCEDURE CHECK_COMPATIBILITY (
         p_table_name            IN  VARCHAR2 DEFAULT NULL,
+        p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_check_id              OUT NUMBER,
         p_has_blocking_issues   OUT BOOLEAN
     ) IS
@@ -484,6 +601,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             WHERE (p_table_name IS NULL OR table_name = p_table_name)
               AND enabled = 'Y';
     BEGIN
+        apply_db_link_override(p_db_link);
+
         FOR t IN c_tables LOOP
 
             IF NOT table_exists(C_SCHEMA_A, t.table_name, NULL) THEN
@@ -493,7 +612,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 CONTINUE;
             END IF;
 
-            IF NOT table_exists(C_SCHEMA_B, t.table_name, C_DB_LINK_B) THEN
+            IF NOT table_exists(C_SCHEMA_B, t.table_name, g_db_link_b) THEN
                 insert_compat_report(v_check_id, t.table_name, NULL, 'MISSING_IN_B', C_SEVERITY_BLOCKING,
                     'Table presente', 'Table absente');
                 v_blocking := TRUE;
@@ -1085,8 +1204,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
         v_sql :=
             'MERGE INTO ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table || ' tgt ' ||
-            'USING (SELECT ' || v_all_cols || ' FROM ' || sanitize_ident(C_SCHEMA_B) || '.' || v_table ||
-            '@' || sanitize_ident(C_DB_LINK_B) || ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL) ||
+            'USING (SELECT ' || v_all_cols || ' FROM ' || b_table_ref(p_table_name) ||
+            ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL) ||
             ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :tn ' ||
             '     AND direction = :dir)) src ' ||
             'ON (' || build_on_clause(p_key_cols, 'tgt', 'src') || ') ' ||
@@ -1157,7 +1276,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         ------------------------------------------------------------------
         IF p_rows_inserted > 0 THEN
             v_sql :=
-                'INSERT INTO ' || sanitize_ident(C_SCHEMA_B) || '.' || v_table || '@' || sanitize_ident(C_DB_LINK_B) ||
+                'INSERT INTO ' || b_table_ref(p_table_name) ||
                 ' (' || v_all_cols || ') ' ||
                 'SELECT ' || v_all_cols || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table ||
                 ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL) ||
@@ -1189,7 +1308,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             END LOOP;
 
             v_sql :=
-                'UPDATE ' || sanitize_ident(C_SCHEMA_B) || '.' || v_table || '@' || sanitize_ident(C_DB_LINK_B) || ' tgt ' ||
+                'UPDATE ' || b_table_ref(p_table_name) || ' tgt ' ||
                 'SET (' || v_non_key_cols || ') = ( ' ||
                 '  SELECT ' || v_select_non_key || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table || ' src ' ||
                 '  WHERE ' || build_on_clause(p_key_cols, 'src', 'tgt') ||
@@ -1274,10 +1393,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                  ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table;
         EXECUTE IMMEDIATE v_sql USING p_run_id, p_table_name;
 
-        -- Côté B (distant, via DB LINK)
+        -- Côté B (distant via DB LINK, ou local direct si C_DB_LINK_B est NULL)
         v_sql := 'INSERT INTO SYNC_WORK_HASH_B (run_id, table_name, pk_hash_key, row_hash) ' ||
                  'SELECT :rid, :tn, ' || v_key_expr || ', ' || v_hash_expr ||
-                 ' FROM ' || sanitize_ident(C_SCHEMA_B) || '.' || v_table || '@' || sanitize_ident(C_DB_LINK_B);
+                 ' FROM ' || b_table_ref(p_table_name);
         EXECUTE IMMEDIATE v_sql USING p_run_id, p_table_name;
     END populate_work_hash;
 
@@ -1381,8 +1500,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             END;
 
             v_sql := 'SELECT JSON_OBJECT(' || v_jo_cols || ')'
-                     || ' FROM ' || sanitize_ident(C_SCHEMA_B) || '.' || v_table
-                     || '@' || sanitize_ident(C_DB_LINK_B)
+                     || ' FROM ' || b_table_ref(p_table_name)
                      || ' WHERE ' || v_hdest || ' = :h';
             BEGIN
                 EXECUTE IMMEDIATE v_sql INTO v_value_b USING p_pk_hash_key;
@@ -1721,11 +1839,84 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     ----------------------------------------------------------------------
+    -- discover_and_register_tables
+    --
+    -- Rôle : appelée par SYNC_ALL UNIQUEMENT lorsque SYNC_TABLE_CONFIG est
+    --        totalement vide (aucune ligne, quelle que soit sa valeur
+    --        ENABLED). Découvre les tables présentes À L'IDENTIQUE (même
+    --        nom) dans SCHEMA_A et SCHEMA_B, et les enregistre dans
+    --        SYNC_TABLE_CONFIG avec des valeurs par défaut prudentes, afin
+    --        de permettre un premier run sans configuration manuelle
+    --        préalable.
+    --
+    -- Valeurs par défaut appliquées (décision de conception, à ajuster
+    -- ensuite table par table si besoin) :
+    --   ENABLED           = 'Y'
+    --   SYNC_DIRECTION    = 'BIDIRECTIONAL'
+    --   CONFLICT_STRATEGY = 'ERROR_ON_CONFLICT'  (jamais d'écrasement
+    --                       silencieux sur une table qu'aucun opérateur n'a
+    --                       explicitement configurée)
+    --   PRIORITY          = 100 (neutre ; l'ordre FK intra-grappe reste
+    --                       gouverné par le tri topologique, inchangé)
+    --   UPDATED_BY        = 'AUTO_DISCOVERY' (au lieu de l'utilisateur
+    --                       courant, pour distinguer visiblement dans
+    --                       SYNC_TABLE_CONFIG les lignes auto-générées des
+    --                       lignes saisies manuellement)
+    --
+    -- Filtrage technique : exclut les tables temporaires (GTT), les
+    -- segments de débordement IOT, et les tables secondaires d'index de
+    -- domaine — seules les tables métier "normales" sont éligibles.
+    --
+    -- Note : les tables sans clé exploitable ne sont PAS filtrées ici ;
+    -- elles sont enregistrées comme les autres puis naturellement exclues
+    -- en BLOCKING (PK_MISSING) par CHECK_COMPATIBILITY, qui s'exécute juste
+    -- après dans SYNC_ALL — pas de duplication de la logique de détection
+    -- de clé à cet endroit.
+    ----------------------------------------------------------------------
+    FUNCTION discover_and_register_tables RETURN NUMBER IS
+        v_sql       VARCHAR2(4000);
+        v_tables    t_str_tab;
+        v_count     NUMBER := 0;
+    BEGIN
+        v_sql :=
+            'SELECT table_name FROM ALL_TABLES ' ||
+            ' WHERE owner = :o1' ||
+            '   AND NVL(temporary,''N'') = ''N''' ||
+            '   AND NVL(nested,''NO'') = ''NO''' ||
+            '   AND NVL(secondary,''N'') = ''N''' ||
+            '   AND (iot_type IS NULL OR iot_type = ''IOT'')' ||
+            ' INTERSECT ' ||
+            'SELECT table_name FROM ALL_TABLES' || b_link_suffix ||
+            ' WHERE owner = :o2' ||
+            '   AND NVL(temporary,''N'') = ''N''' ||
+            '   AND NVL(nested,''NO'') = ''NO''' ||
+            '   AND NVL(secondary,''N'') = ''N''' ||
+            '   AND (iot_type IS NULL OR iot_type = ''IOT'')';
+
+        EXECUTE IMMEDIATE v_sql BULK COLLECT INTO v_tables USING C_SCHEMA_A, C_SCHEMA_B;
+
+        FOR i IN 1 .. v_tables.COUNT LOOP
+            INSERT INTO SYNC_TABLE_CONFIG (
+                table_name, enabled, sync_delete, sync_direction,
+                conflict_strategy, priority, updated_by
+            ) VALUES (
+                v_tables(i), 'Y', 'N', C_DIRECTION_BIDIRECTIONAL,
+                C_CONFLICT_ERROR_ON_CONFLICT, 100, 'AUTO_DISCOVERY'
+            );
+            v_count := v_count + 1;
+        END LOOP;
+
+        RETURN v_count;
+    END discover_and_register_tables;
+
+
+    ----------------------------------------------------------------------
     -- SYNC_ALL  (procédure publique)
     ----------------------------------------------------------------------
     PROCEDURE SYNC_ALL (
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
         p_error_mode    IN  VARCHAR2 DEFAULT C_ERROR_MODE_CONTINUE,
+        p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_run_id        OUT NUMBER
     ) IS
         v_run_id            NUMBER := SYNC_RUN_ID_SEQ.NEXTVAL;
@@ -1742,17 +1933,39 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_failed_count      NUMBER := 0;
         v_stopped_early     BOOLEAN := FALSE;
         v_final_status      VARCHAR2(30);
+        v_config_count      NUMBER;
+        v_discovered_count  NUMBER;
+        -- Oracle SQL n'a pas de type BOOLEAN (contrairement à PL/SQL) : un
+        -- paramètre IN BOOLEAN ne peut jamais être référencé, même via
+        -- CASE WHEN, à l'intérieur d'une instruction SQL statique (INSERT/
+        -- UPDATE/SELECT) — d'où ORA-00920 si on l'y tente directement. On
+        -- convertit donc TOUJOURS le BOOLEAN en VARCHAR2 'Y'/'N' par une
+        -- affectation PL/SQL pure (ligne ci-dessous, hors de tout contexte
+        -- SQL), puis on n'utilise plus que cette variable dans le INSERT.
+        v_dry_run_flag      VARCHAR2(1) := CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END;
     BEGIN
+        apply_db_link_override(p_db_link);
+
         INSERT INTO SYNC_RUN_HEADER (run_id, run_type, dry_run, error_mode)
-        VALUES (v_run_id, 'SYNC_ALL', CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END, p_error_mode);
+        VALUES (v_run_id, 'SYNC_ALL', v_dry_run_flag, p_error_mode);
         COMMIT; -- l'en-tête doit rester traçable même si tout échoue ensuite
 
         p_run_id := v_run_id;
 
         ------------------------------------------------------------------
+        -- 0) Découverte automatique si SYNC_TABLE_CONFIG est totalement vide
+        ------------------------------------------------------------------
+        SELECT COUNT(*) INTO v_config_count FROM SYNC_TABLE_CONFIG;
+
+        IF v_config_count = 0 THEN
+            v_discovered_count := discover_and_register_tables;
+            COMMIT;
+        END IF;
+
+        ------------------------------------------------------------------
         -- 1) Compatibilité (systématique en tête de run, décision validée)
         ------------------------------------------------------------------
-        CHECK_COMPATIBILITY(NULL, v_check_id, v_blocking);
+        CHECK_COMPATIBILITY(p_table_name => NULL, p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
 
         SELECT table_name BULK COLLECT INTO v_active_tables
         FROM SYNC_TABLE_CONFIG stc
@@ -1865,6 +2078,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     PROCEDURE SYNC_TABLE (
         p_table_name    IN  VARCHAR2,
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
+        p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_run_id        OUT NUMBER
     ) IS
         v_run_id        NUMBER := SYNC_RUN_ID_SEQ.NEXTVAL;
@@ -1873,7 +2087,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_status        VARCHAR2(30);
         v_exists        NUMBER;
         v_final_status  VARCHAR2(30);
+        -- Cf. commentaire équivalent dans SYNC_ALL : un BOOLEAN PL/SQL ne
+        -- peut jamais être référencé, même via CASE WHEN, à l'intérieur
+        -- d'une instruction SQL statique (ORA-00920 sinon).
+        v_dry_run_flag  VARCHAR2(1) := CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END;
     BEGIN
+        apply_db_link_override(p_db_link);
+
         SELECT COUNT(*) INTO v_exists FROM SYNC_TABLE_CONFIG
         WHERE table_name = p_table_name AND enabled = 'Y' AND sync_direction != C_DIRECTION_DISABLED;
 
@@ -1883,12 +2103,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END IF;
 
         INSERT INTO SYNC_RUN_HEADER (run_id, run_type, dry_run, error_mode)
-        VALUES (v_run_id, 'SYNC_TABLE', CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END, C_ERROR_MODE_STOP);
+        VALUES (v_run_id, 'SYNC_TABLE', v_dry_run_flag, C_ERROR_MODE_STOP);
         COMMIT;
 
         p_run_id := v_run_id;
 
-        CHECK_COMPATIBILITY(p_table_name, v_check_id, v_blocking);
+        CHECK_COMPATIBILITY(p_table_name => p_table_name, p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
 
         IF v_blocking THEN
             UPDATE SYNC_RUN_HEADER SET
