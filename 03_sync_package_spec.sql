@@ -71,6 +71,13 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- comme nom de DB LINK réel (improbable, mais à éviter explicitement).
     C_DB_LINK_KEEP_CURRENT  CONSTANT VARCHAR2(30) := '$$KEEP_CURRENT_DB_LINK$$';
 
+    -- Sentinelle du paramètre p_sync_mode de SYNC_ALL / SYNC_TABLE /
+    -- SYNC_TABLES ("mode non renseigné : utiliser le SYNC_MODE de chaque table").
+    -- Distincte des trois modes fonctionnels ci-dessous, cf. C_DB_LINK_KEEP_CURRENT
+    -- pour la même justification (NULL ne peut pas servir de sentinelle ici car il
+    -- n'a pas de sens fonctionnel particulier).
+    C_SYNC_MODE_KEEP_CURRENT  CONSTANT VARCHAR2(30) := '$$KEEP_CURRENT_SYNC_MODE$$';
+
     --------------------------------------------------------------------------
     -- CONSTANTES FONCTIONNELLES
     --
@@ -98,6 +105,15 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     C_DIRECTION_A_TO_B         CONSTANT VARCHAR2(20) := 'A_TO_B';
     C_DIRECTION_B_TO_A         CONSTANT VARCHAR2(20) := 'B_TO_A';
     C_DIRECTION_DISABLED       CONSTANT VARCHAR2(20) := 'DISABLED';
+
+    -- Mode des opérations appliquées (SYNC_TABLE_CONFIG.SYNC_MODE, ou
+    -- p_sync_mode en override ponctuel de run) :
+    --   INSERT  : seules les insertions sont appliquées.
+    --   UPDATE  : seules les mises à jour sont appliquées.
+    --   INSERT_UPDATE : les deux (comportement historique, défaut).
+    C_SYNC_MODE_INSERT         CONSTANT VARCHAR2(20) := 'INSERT';
+    C_SYNC_MODE_UPDATE         CONSTANT VARCHAR2(20) := 'UPDATE';
+    C_SYNC_MODE_INSERT_UPDATE  CONSTANT VARCHAR2(20) := 'INSERT_UPDATE';
 
     -- Stratégies de résolution de conflit (SYNC_TABLE_CONFIG.CONFLICT_STRATEGY)
     -- NB : LAST_UPDATE_WINS volontairement absente (retirée du périmètre v1).
@@ -166,6 +182,13 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- API PUBLIQUE
     --------------------------------------------------------------------------
 
+    --------------------------------------------------------------------------
+    -- Type public de liste de tables logiques (noms dans SYNC_TABLE_CONFIG.
+    -- TABLE_NAME), utilisé par SYNC_TABLES et par la surcharge LIST de
+    -- CHECK_COMPATIBILITY.
+    --------------------------------------------------------------------------
+    TYPE t_tab_name_list IS TABLE OF VARCHAR2(128);
+
     ----------------------------------------------------------------------
     -- SET_DB_LINK
     --
@@ -227,6 +250,13 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --                   SET_DB_LINK précédent) s'applique sans changement.
     --   p_run_id      : identifiant du run généré (SYNC_RUN_ID_SEQ), à
     --                   utiliser ensuite avec GET_RUN_STATUS.
+    --   p_sync_mode   : optionnel. Si renseigné (différent de la sentinelle
+    --                   C_SYNC_MODE_KEEP_CURRENT), applique CE mode (INSERT /
+    --                   UPDATE / INSERT_UPDATE) à TOUTES les tables du run, en
+    --                   ignorant leur SYNC_MODE de configuration (sans
+    --                   persistance : la colonne SYNC_TABLE_CONFIG.SYNC_MODE
+    --                   n'est pas modifiée). Laissé à sa valeur par défaut,
+    --                   chaque table suit son SYNC_MODE configuré.
     --
     -- Risque documenté : en cas d'exception non gérée en dehors de la boucle
     -- de traitement des grappes (erreur structurelle avant même le début du
@@ -237,7 +267,8 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
         p_error_mode    IN  VARCHAR2 DEFAULT C_ERROR_MODE_CONTINUE,
         p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
-        p_run_id        OUT NUMBER
+        p_run_id        OUT NUMBER,
+        p_sync_mode     IN  VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT
     );
 
     ----------------------------------------------------------------------
@@ -261,11 +292,57 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --
     -- p_db_link : cf. SYNC_ALL — optionnel, override ponctuel équivalent à
     -- SET_DB_LINK(p_db_link) avant ce run.
+    -- p_sync_mode : cf. SYNC_ALL — optionnel, override ponctuel du mode
+    -- SYNC_MODE configuré pour cette table (sans persistance).
     ----------------------------------------------------------------------
     PROCEDURE SYNC_TABLE (
         p_table_name    IN  VARCHAR2,
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
         p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+        p_run_id        OUT NUMBER,
+        p_sync_mode     IN  VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT
+    );
+
+    ----------------------------------------------------------------------
+    -- SYNC_TABLES
+    --
+    -- Synchronise une LISTE de tables (type public t_tab_name_list), avec
+    -- RÉSOLUTION IMPLICITE DES DÉPENDANCES FK : l'ensemble exécuté = tables
+    -- demandées ∪ fermeture transitive de leurs tables PARENTES (ancêtres
+    -- via les contraintes FK de SCHEMA_A) configurées et actives
+    -- (ENABLED='Y' et SYNC_DIRECTION != 'DISABLED'). Les parents hors
+    -- configuration (ou désactivés) ne sont PAS ajoutés — ils restent hors
+    -- périmètre (signalé dans le rapport de compatibilité le cas échéant).
+    --
+    -- Pourquoi : éviter ORA-02291 ("parent key not found") lors des
+    -- insertions — insérer un enfant sans avoir synchronisé son parent peut
+    -- violer la FK — et garantir un ordre topologique cohérent (parent avant
+    -- enfant), exactement comme SYNC_ALL mais restreint au sous-ensemble.
+    --
+    -- Seuls les PARENTS sont ajoutés (pas les enfants) : la demande concerne
+    -- un rattrapage ciblé, élargir aux descendants modifierait le périmètre
+    -- au-delà de l'intention de l'appelant.
+    --
+    -- L'ensemble final est ensuite traité exactement comme SYNC_ALL :
+    -- CHECK_COMPATIBILITY sur le sous-ensemble (un seul CHECK_ID), exclusion
+    -- des tables BLOCKING, grappes FK / tri topologique / priorité moyenne,
+    -- validation par grappe. RUN_TYPE de l'en-tête = 'SYNC_TABLES' ;
+    -- TOTAL_TABLES/TABLES_EXCLUDED portent sur l'ensemble exécuté (demandées
+    -- + parents), afin que le compte du run reste cohérent avec ce qui a
+    -- réellement été traité.
+    --
+    -- Lève E_TABLE_NOT_CONFIGURED si une table de la liste n'existe pas dans
+    -- SYNC_TABLE_CONFIG ou y est désactivée, et E_INVALID_PARAMETER si la
+    -- liste est vide ou si p_sync_mode est inconnu.
+    --
+    -- p_dry_run / p_error_mode / p_db_link / p_sync_mode : cf. SYNC_ALL.
+    ----------------------------------------------------------------------
+    PROCEDURE SYNC_TABLES (
+        p_table_list    IN  t_tab_name_list,
+        p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
+        p_error_mode    IN  VARCHAR2 DEFAULT C_ERROR_MODE_CONTINUE,
+        p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+        p_sync_mode     IN  VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT,
         p_run_id        OUT NUMBER
     );
 
@@ -294,6 +371,25 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     ----------------------------------------------------------------------
     PROCEDURE CHECK_COMPATIBILITY (
         p_table_name            IN  VARCHAR2 DEFAULT NULL,
+        p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+        p_check_id              OUT NUMBER,
+        p_has_blocking_issues   OUT BOOLEAN
+    );
+
+    ----------------------------------------------------------------------
+    -- CHECK_COMPATIBILITY (surcharge LISTE)
+    --
+    -- Même contrôle, restreint à une LISTE explicite de tables (type public
+    -- t_tab_name_list). Un seul CHECK_ID regroupe les anomalies des tables de
+    -- la liste. Le contrôle porte sur les tables données TELLES QUELLES
+    -- (aucune exigence d'activation dans SYNC_TABLE_CONFIG : utile pour
+    -- pré-valider une table même non encore configurée).
+    --
+    -- p_db_link : cf. SYNC_ALL — optionnel, override ponctuel équivalent à
+    -- SET_DB_LINK(p_db_link) avant ce contrôle.
+    ----------------------------------------------------------------------
+    PROCEDURE CHECK_COMPATIBILITY (
+        p_table_list            IN  t_tab_name_list,
         p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
         p_check_id              OUT NUMBER,
         p_has_blocking_issues   OUT BOOLEAN

@@ -24,7 +24,8 @@
 CREATE TABLE SYNC_RUN_HEADER (
     RUN_ID              NUMBER          NOT NULL,
 
-    -- 'SYNC_ALL' ou 'SYNC_TABLE' : trace le point d'entrée utilisé pour ce run.
+    -- 'SYNC_ALL', 'SYNC_TABLE' ou 'SYNC_TABLES' : trace le point d'entrée utilisé
+    -- pour ce run.
     RUN_TYPE            VARCHAR2(20)    NOT NULL,
 
     START_DATE          TIMESTAMP       DEFAULT SYSTIMESTAMP NOT NULL,
@@ -54,7 +55,7 @@ CREATE TABLE SYNC_RUN_HEADER (
     CONSTRAINT PK_SYNC_RUN_HEADER PRIMARY KEY (RUN_ID),
 
     CONSTRAINT CK_SRH_RUN_TYPE
-        CHECK (RUN_TYPE IN ('SYNC_ALL','SYNC_TABLE')),
+        CHECK (RUN_TYPE IN ('SYNC_ALL','SYNC_TABLE','SYNC_TABLES')),
 
     CONSTRAINT CK_SRH_STATUS
         CHECK (STATUS IN ('IN_PROGRESS','SUCCESS','SUCCESS_WITH_CONFLICTS','PARTIAL','FAILED')),
@@ -67,7 +68,7 @@ CREATE TABLE SYNC_RUN_HEADER (
 );
 
 COMMENT ON TABLE SYNC_RUN_HEADER IS
-    'Une ligne par execution de SYNC_ALL/SYNC_TABLE. Statut global agrege depuis SYNC_LOG.';
+    'Une ligne par execution de SYNC_ALL/SYNC_TABLE/SYNC_TABLES. Statut global agrege depuis SYNC_LOG.';
 
 
 --------------------------------------------------------------------------------
@@ -102,6 +103,11 @@ CREATE TABLE SYNC_LOG (
     -- l'ordonnancement calculé, utile en diagnostic).
     CLUSTER_ID              NUMBER,
     CLUSTER_ORDER           NUMBER,         -- position dans le tri topologique intra-grappe
+
+    -- Mode d'application EFFECTIF pour cette table sur ce run
+    -- (INSERT / UPDATE / INSERT_UPDATE). NULL pour les lignes de résolution
+    -- explicitement sans contexte de mode (échec ré-inséré par l'appelant).
+    SYNC_MODE               VARCHAR2(20),
 
     ROWS_INSERTED_A_TO_B    NUMBER          DEFAULT 0 NOT NULL,
     ROWS_INSERTED_B_TO_A    NUMBER          DEFAULT 0 NOT NULL,

@@ -605,5 +605,77 @@ END;
 -- DROP PROCEDURE TEST_HEADER;
 
 --------------------------------------------------------------------------------
+-- TEST 17 — SYNC_TABLES : synchronisation par liste + expansion implicite des
+--            dépendances FK (parents uniquement).
+--
+-- On ne demande QUE COMMANDE_LIGNE. La résolution implicite doit remonter la
+-- chaîne CLIENT <- COMMANDE <- COMMANDE_LIGNE et PRODUIT <- COMMANDE_LIGNE, et
+-- donc exécuter les 4 tables, parents AVANT enfants (ordre topologique).
+--------------------------------------------------------------------------------
+DECLARE
+    v_run_id   NUMBER;
+    v_run_type VARCHAR2(20);
+    v_total    NUMBER;
+    v_status   VARCHAR2(30);
+BEGIN
+    PKG_SCHEMA_SYNC.SYNC_TABLES(
+        p_table_list => PKG_SCHEMA_SYNC.t_tab_name_list('COMMANDE_LIGNE'),
+        p_dry_run    => TRUE,
+        p_run_id     => v_run_id
+    );
+    DBMS_OUTPUT.PUT_LINE('Run ID (SYNC_TABLES) : ' || v_run_id);
+
+    SELECT run_type, total_tables, status
+      INTO v_run_type, v_total, v_status
+      FROM SYNC_RUN_HEADER WHERE run_id = v_run_id;
+
+    DBMS_OUTPUT.PUT_LINE('RUN_TYPE attendu SYNC_TABLES -> ' || v_run_type);
+    DBMS_OUTPUT.PUT_LINE('TOTAL_TABLES attendu 4 (1 demandee + 3 parents) -> ' || v_total);
+    DBMS_OUTPUT.PUT_LINE('STATUS -> ' || v_status);
+END;
+/
+
+SELECT 'Test 17 - Perimetre etendu (4 tables, parents implicites)' AS verif,
+       TABLE_NAME, Cluster_Id, Cluster_Order, Status, Sync_Mode
+FROM SYNC_LOG
+WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM SYNC_RUN_HEADER WHERE RUN_TYPE = 'SYNC_TABLES')
+ORDER BY Cluster_Id, Cluster_Order, TABLE_NAME;
+
+-- Les parents doivent apparaître AVANT leur enfant dans l'ordre topologique.
+SELECT 'Test 17 - Parents traites avant COMMANDE_LIGNE ?' AS verif,
+       MIN(CASE WHEN TABLE_NAME = 'COMMANDE_LIGNE' THEN Cluster_Order END) AS ordre_enfant,
+       MAX(CASE WHEN TABLE_NAME IN ('CLIENT','COMMANDE','PRODUIT') THEN Cluster_Order END) AS ordre_parent_max
+FROM SYNC_LOG
+WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM SYNC_RUN_HEADER WHERE RUN_TYPE = 'SYNC_TABLES');
+
+--------------------------------------------------------------------------------
+-- TEST 18 — Mode de synchronisation (SYNC_MODE par table + override de run).
+--
+-- 18a. Défaut de configuration : SYNC_TABLE sans p_sync_mode -> INSERT_UPDATE.
+-- 18b. Override de run : p_sync_mode => 'INSERT' -> journalisé dans SYNC_LOG,
+--      sans modification persistante de SYNC_TABLE_CONFIG.
+--------------------------------------------------------------------------------
+DECLARE
+    v_run_id NUMBER;
+    v_mode   VARCHAR2(20);
+BEGIN
+    PKG_SCHEMA_SYNC.SYNC_TABLE('CLIENT', p_dry_run => TRUE, p_run_id => v_run_id);
+    SELECT SYNC_MODE INTO v_mode FROM SYNC_LOG
+     WHERE RUN_ID = v_run_id AND TABLE_NAME = 'CLIENT' AND ROWNUM = 1;
+    DBMS_OUTPUT.PUT_LINE('Test 18a - mode par defaut -> ' || NVL(v_mode, '<NULL>') || ' (attendu INSERT_UPDATE)');
+
+    PKG_SCHEMA_SYNC.SYNC_TABLE('CLIENT', p_dry_run => TRUE,
+        p_sync_mode => PKG_SCHEMA_SYNC.C_SYNC_MODE_INSERT, p_run_id => v_run_id);
+    SELECT SYNC_MODE INTO v_mode FROM SYNC_LOG
+     WHERE RUN_ID = v_run_id AND TABLE_NAME = 'CLIENT' AND ROWNUM = 1;
+    DBMS_OUTPUT.PUT_LINE('Test 18b - mode override run -> ' || NVL(v_mode, '<NULL>') || ' (attendu INSERT)');
+END;
+/
+
+SELECT 'Test 18 - Override non persiste en configuration ?' AS verif,
+       TABLE_NAME, SYNC_MODE
+FROM SYNC_TABLE_CONFIG WHERE TABLE_NAME = 'CLIENT';
+
+--------------------------------------------------------------------------------
 -- FIN SCRIPT 6
 --------------------------------------------------------------------------------

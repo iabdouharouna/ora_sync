@@ -40,6 +40,18 @@ CREATE TABLE SYNC_TABLE_CONFIG (
     -- DISABLED       : ligne de config conservée mais ignorée par SYNC_ALL.
     SYNC_DIRECTION      VARCHAR2(20)    DEFAULT 'BIDIRECTIONAL' NOT NULL,
 
+    -- Mode des opérations appliquées pour cette table :
+    --   INSERT         : uniquement les insertions (INSERT_TO_A / INSERT_TO_B),
+    --                   les mises à jour d'écarts existants sont ignorées.
+    --   UPDATE         : uniquement les mises à jour (UPDATE_TO_A / UPDATE_TO_B),
+    --                   les insertions de lignes nouvelles sont ignorées.
+    --   INSERT_UPDATE  : les deux (comportement historique).
+    -- NB : la classification (diagnostic, conflits) reste complète quel que soit
+    -- le mode : seul l'APPLICATION est filtrée. Le mode par défaut peut être
+    -- surchargé ponctuellement pour un run via p_sync_mode sur SYNC_ALL /
+    -- SYNC_TABLE / SYNC_TABLES (sans persistance).
+    SYNC_MODE           VARCHAR2(20)    DEFAULT 'INSERT_UPDATE' NOT NULL,
+
     -- Stratégie appliquée uniquement quand SYNC_DIRECTION='BIDIRECTIONAL'
     -- et qu'un conflit réel (modification des deux côtés) est détecté.
     -- LAST_UPDATE_WINS volontairement absente du périmètre v1 : elle
@@ -73,6 +85,9 @@ CREATE TABLE SYNC_TABLE_CONFIG (
     CONSTRAINT CK_STC_DIRECTION
         CHECK (SYNC_DIRECTION IN ('BIDIRECTIONAL','A_TO_B','B_TO_A','DISABLED')),
 
+    CONSTRAINT CK_STC_SYNC_MODE
+        CHECK (SYNC_MODE IN ('INSERT','UPDATE','INSERT_UPDATE')),
+
     CONSTRAINT CK_STC_CONFLICT_STRATEGY
         CHECK (CONFLICT_STRATEGY IN ('SOURCE_A_WINS','SOURCE_B_WINS','ERROR_ON_CONFLICT')),
 
@@ -86,6 +101,8 @@ COMMENT ON COLUMN SYNC_TABLE_CONFIG.SYNC_DELETE IS
     'Verrouillée a N en v1. Reservee a une v2 avec mecanisme de tombstone.';
 COMMENT ON COLUMN SYNC_TABLE_CONFIG.PRIORITY IS
     'Ordonnancement INTER-grappes uniquement (moyenne par grappe). Sans effet intra-grappe : ordre FK prioritaire.';
+COMMENT ON COLUMN SYNC_TABLE_CONFIG.SYNC_MODE IS
+    'Operations appliquees pour la table : INSERT / UPDATE / INSERT_UPDATE (defaut). Surchargable par p_sync_mode au niveau du run.';
 
 
 --------------------------------------------------------------------------------

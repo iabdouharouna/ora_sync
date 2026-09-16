@@ -19,6 +19,9 @@
 --   3. Tables de travail (GTT SYNC_WORK_HASH_A/B, SYNC_WORK_DIFF) -> recréées
 --      avec PK_HASH_KEY VARCHAR2(64). Aucune donnée persistante (segment
 --      privé temporaire), la recréation est sans risque.
+--   4. (v3 — idempotent) SYNC_TABLE_CONFIG.SYNC_MODE + contrainte,
+--      SYNC_LOG.SYNC_MODE, et RUN_TYPE de SYNC_RUN_HEADER élargi à
+--      'SYNC_TABLES' (nouvelle procédure SYNC_TABLES).
 --
 -- Ordre de déploiement recommandé :
 --    08_migration_v2.sql  puis  04 (recompile)  puis  07 (harnais)
@@ -127,7 +130,92 @@ CREATE INDEX IX_SWD_LOOKUP ON SYNC_WORK_DIFF (RUN_ID, TABLE_NAME, DIFF_TYPE);
 
 PROMPT => 3. Tables de travail recreees (PK_HASH_KEY VARCHAR2(64)).
 
-PROMPT => Migration v2 terminee. Recompiler maintenant : 04_sync_package_body.sql
+
+--------------------------------------------------------------------------------
+-- 4. (v3) SYNC_TABLE_CONFIG.SYNC_MODE, SYNC_LOG.SYNC_MODE, SYNC_RUN_HEADER.
+--    RUN_TYPE elargi a 'SYNC_TABLES' — idempotent.
+--------------------------------------------------------------------------------
+
+-- 4.1 SYNC_TABLE_CONFIG.SYNC_MODE
+DECLARE
+    v_nb NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_nb
+    FROM all_tab_columns
+    WHERE owner = USER AND table_name = 'SYNC_TABLE_CONFIG' AND column_name = 'SYNC_MODE';
+
+    IF v_nb = 0 THEN
+        EXECUTE IMMEDIATE 'ALTER TABLE SYNC_TABLE_CONFIG ADD (SYNC_MODE VARCHAR2(20) DEFAULT ''INSERT_UPDATE'' NOT NULL)';
+        DBMS_OUTPUT.PUT_LINE('SYNC_TABLE_CONFIG.SYNC_MODE : colonne ajoutee (defaut INSERT_UPDATE).');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('SYNC_TABLE_CONFIG.SYNC_MODE : deja presente, aucune action.');
+    END IF;
+
+    SELECT COUNT(*) INTO v_nb
+    FROM all_constraints
+    WHERE owner = USER AND constraint_name = 'CK_STC_SYNC_MODE';
+
+    IF v_nb = 0 THEN
+        EXECUTE IMMEDIATE ('ALTER TABLE SYNC_TABLE_CONFIG ADD CONSTRAINT CK_STC_SYNC_MODE ' ||
+                           'CHECK (SYNC_MODE IN (''INSERT'',''UPDATE'',''INSERT_UPDATE''))');
+        DBMS_OUTPUT.PUT_LINE('SYNC_TABLE_CONFIG : CK_STC_SYNC_MODE ajoutee.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('SYNC_TABLE_CONFIG : CK_STC_SYNC_MODE deja presente.');
+    END IF;
+END;
+/
+
+-- 4.2 SYNC_LOG.SYNC_MODE (traçabilité du mode effectif par table)
+DECLARE
+    v_nb NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_nb
+    FROM all_tab_columns
+    WHERE owner = USER AND table_name = 'SYNC_LOG' AND column_name = 'SYNC_MODE';
+
+    IF v_nb = 0 THEN
+        EXECUTE IMMEDIATE 'ALTER TABLE SYNC_LOG ADD (SYNC_MODE VARCHAR2(20))';
+        DBMS_OUTPUT.PUT_LINE('SYNC_LOG.SYNC_MODE : colonne ajoutee.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('SYNC_LOG.SYNC_MODE : deja presente, aucune action.');
+    END IF;
+END;
+/
+
+-- 4.3 CK_SRH_RUN_TYPE ellargi a 'SYNC_TABLES'
+DECLARE
+    v_nb NUMBER;
+    v_ok NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_ok
+    FROM all_cons_columns cc
+    JOIN all_constraints c ON c.constraint_name = cc.constraint_name AND c.owner = cc.owner
+    WHERE c.owner = USER AND c.constraint_name = 'CK_SRH_RUN_TYPE'
+      AND cc.column_name = 'RUN_TYPE'
+      AND cc.position = 1
+      AND c.search_condition_vc LIKE '%SYNC_TABLES%';
+
+    IF v_ok = 0 THEN
+        SELECT COUNT(*) INTO v_nb
+        FROM all_constraints
+        WHERE owner = USER AND constraint_name = 'CK_SRH_RUN_TYPE';
+
+        IF v_nb > 0 THEN
+            EXECUTE IMMEDIATE 'ALTER TABLE SYNC_RUN_HEADER DROP CONSTRAINT CK_SRH_RUN_TYPE';
+        END IF;
+
+        EXECUTE IMMEDIATE ('ALTER TABLE SYNC_RUN_HEADER ADD CONSTRAINT CK_SRH_RUN_TYPE ' ||
+                           'CHECK (RUN_TYPE IN (''SYNC_ALL'',''SYNC_TABLE'',''SYNC_TABLES''))');
+        DBMS_OUTPUT.PUT_LINE('SYNC_RUN_HEADER : CK_SRH_RUN_TYPE elargie a SYNC_TABLES.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('SYNC_RUN_HEADER : CK_SRH_RUN_TYPE deja au perimetre SYNC_TABLES.');
+    END IF;
+END;
+/
+
+PROMPT => 4. Evolutions v3 appliquees (SYNC_MODE + RUN_TYPE).
+
+PROMPT => Migration v2/v3 terminee. Recompiler maintenant : 04_sync_package_body.sql
 PROMPT => puis lancer : 07_test_harness.sql
 
 --------------------------------------------------------------------------------

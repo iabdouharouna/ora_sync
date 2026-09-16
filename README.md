@@ -19,6 +19,7 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 5. [Limites connues et risques assumés](#5-limites-connues-et-risques-assumés)
 6. [Annexes](#6-annexes)
 7. [Changelog v2](#7-changelog-v2)
+8. [Changelog v3](#8-changelog-v3)
 
 ---
 
@@ -143,6 +144,36 @@ Le package peut s'exécuter en mode simulation (`p_dry_run = TRUE`) : le diagnos
 
 > **Limite de la garantie** — L'idempotence n'est garantie qu'en l'absence de conflit non résolu. Un run avec des conflits en attente (`ERROR_ON_CONFLICT`) reste par nature divergent tant qu'aucune intervention manuelle n'a tranché — le statut de run `SUCCESS_WITH_CONFLICTS` reflète explicitement cet état.
 
+### 3.8. Mode de synchronisation (INSERT / UPDATE / INSERT_UPDATE)
+
+Le mode d'application détermine quelles opérations le package est autorisé à propager :
+
+| Mode | Comportement |
+|------|--------------|
+| `INSERT` | Seules les créations sont propagées ; les divergences de lignes existantes sont ignorées |
+| `UPDATE` | Seules les mises à jour de lignes existantes sont propagées ; les créations sont ignorées |
+| `INSERT_UPDATE` | Comportement complet (défaut) : créations **et** mises à jour |
+
+Le mode se règle à deux niveaux, dans cet ordre de priorité :
+
+1. **Par table** — colonne `SYNC_MODE` de `SYNC_TABLE_CONFIG` (défaut `INSERT_UPDATE`, contrainte `CK_STC_SYNC_MODE`).
+2. **Par run** — paramètre `p_sync_mode` sur `SYNC_ALL`, `SYNC_TABLE` et `SYNC_TABLES`. Un override de run **ne persiste pas** en configuration.
+
+La sentinelle `C_SYNC_MODE_KEEP_CURRENT` (valeur par défaut) signifie « utiliser le mode configuré par table ». Un mode inconnu est rejeté en entrée (`E_INVALID_PARAMETER`, `-20011`), avant tout effet de bord. Le mode **effectif** de chaque table est journalisé dans `SYNC_LOG.SYNC_MODE`.
+
+### 3.9. Périmètre par liste de tables et expansion implicite des dépendances FK
+
+`SYNC_TABLES` prend une **liste** de tables logiques (`t_tab_name_list`) et applique la **résolution implicite des dépendances FK** : la fermeture transitive des **tables parentes** (ancêtres FK) configurées et actives est automatiquement ajoutée au périmètre. L'objectif est d'éviter les incohérences référentielles lorsqu'un appelant cible une table enfant sans citer ses parents.
+
+Règles :
+
+- Chaque table demandée doit exister en configuration et être active (`ENABLED='Y'`, `SYNC_DIRECTION != 'DISABLED'`), sinon `E_TABLE_NOT_CONFIGURED` (`-20002`).
+- Seuls les **parents** sont ajoutés (jamais les enfants ni les tables sans lien).
+- Seuls les parents **configurés et actifs** sont retenus ; un parent non configuré est simplement ignoré (il n'a pas à être synchronisé).
+- L'ensemble résolu est exécuté par grappes, dans l'ordre topologique (parents avant enfants), exactement comme `SYNC_ALL`.
+
+> **Différence avec `SYNC_TABLE`** — `SYNC_TABLE` ne traite que la table demandée (rattrapage ciblé). `SYNC_TABLES` étend ce périmètre aux parents FK nécessaires à la cohérence, tout en restant plus restreint qu'un `SYNC_ALL` complet.
+
 ---
 
 ## 4. Architecture technique
@@ -162,7 +193,7 @@ SYNC_ADMIN (+ SCHEMA_A) ──────────────────�
 
 | Table | Rôle |
 |-------|------|
-| `SYNC_TABLE_CONFIG` | Liste pilote des tables synchronisées : activation, sens, stratégie de conflit, priorité |
+| `SYNC_TABLE_CONFIG` | Liste pilote des tables synchronisées : activation, sens, stratégie de conflit, priorité, mode (`SYNC_MODE`) |
 | `SYNC_COLUMN_CONFIG` | Colonnes explicitement exclues de la comparaison et de l'écriture, par table |
 | `SYNC_KEY_CONFIG` | Clé de correspondance explicite pour les tables sans PK/UNIQUE détectable automatiquement |
 
@@ -170,8 +201,8 @@ SYNC_ADMIN (+ SCHEMA_A) ──────────────────�
 
 | Table | Rôle |
 |-------|------|
-| `SYNC_RUN_HEADER` | Statut global d'une exécution de `SYNC_ALL` ou `SYNC_TABLE`, agrégé depuis `SYNC_LOG` |
-| `SYNC_LOG` | Détail par table pour un run : volumétrie, statut, erreurs |
+| `SYNC_RUN_HEADER` | Statut global d'une exécution de `SYNC_ALL`, `SYNC_TABLE` ou `SYNC_TABLES`, agrégé depuis `SYNC_LOG` |
+| `SYNC_LOG` | Détail par table pour un run : volumétrie, statut, erreurs, mode effectif (`SYNC_MODE`) |
 | `SYNC_CONFLICT` | Historique des conflits réels et des écarts forcés (sens unique), avec résolution appliquée |
 | `SYNC_COMPATIBILITY_REPORT` | Anomalies de structure détectées par `CHECK_COMPATIBILITY` |
 
@@ -191,16 +222,34 @@ PKG_SCHEMA_SYNC.SYNC_ALL(
     p_dry_run     IN BOOLEAN  DEFAULT FALSE,
     p_error_mode  IN VARCHAR2 DEFAULT 'CONTINUE',
     p_db_link     IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+    p_sync_mode   IN VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT,
     p_run_id      OUT NUMBER);
 
 PKG_SCHEMA_SYNC.SYNC_TABLE(
     p_table_name  IN VARCHAR2,
     p_dry_run     IN BOOLEAN DEFAULT FALSE,
     p_db_link     IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+    p_sync_mode   IN VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT,
+    p_run_id      OUT NUMBER);
+
+-- Liste de tables + expansion implicite des parents FK (v3)
+PKG_SCHEMA_SYNC.SYNC_TABLES(
+    p_table_list  IN t_tab_name_list,
+    p_dry_run     IN BOOLEAN  DEFAULT FALSE,
+    p_error_mode  IN VARCHAR2 DEFAULT 'CONTINUE',
+    p_db_link     IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+    p_sync_mode   IN VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT,
     p_run_id      OUT NUMBER);
 
 PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(
     p_table_name           IN VARCHAR2 DEFAULT NULL,
+    p_db_link              IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+    p_check_id             OUT NUMBER,
+    p_has_blocking_issues  OUT BOOLEAN);
+
+-- Surcharge sur liste (v3) : même contrôle sur un sous-ensemble de tables
+PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(
+    p_table_list           IN t_tab_name_list,
     p_db_link              IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
     p_check_id             OUT NUMBER,
     p_has_blocking_issues  OUT BOOLEAN);
@@ -217,11 +266,13 @@ PKG_SCHEMA_SYNC.PURGE_HISTORY(p_keep_days IN NUMBER);
 
 Les schémas A et B ne sont pas des paramètres d'appel : ils sont fixés par des constantes de package (`C_SCHEMA_A`, `C_SCHEMA_B`, `C_DB_LINK_B`), pour éviter qu'un appelant ne redirige accidentellement la synchronisation.
 
-La cible distante (`p_db_link`, ajouté en v2) peut être surchargée à l'exécution, sans recompilation : soit ponctuellement via `p_db_link` sur `SYNC_ALL`/`SYNC_TABLE`/`CHECK_COMPATIBILITY`, soit pour toute la session via `SET_DB_LINK` (`GET_DB_LINK` restitue la valeur active ; `NULL` = mode « même instance », sans DB LINK). La sentinelle `C_DB_LINK_KEEP_CURRENT` (valeur par défaut) signifie « ne rien changer à la valeur courante ». Un paramètre invalide (`p_error_mode` hors périmètre, `p_db_link` malformé, `p_keep_days <= 0`) est rejeté en entrée (`E_INVALID_PARAMETER`, ou `-20010` pour un identifiant SQL non conforme), **avant** tout effet de bord.
+La cible distante (`p_db_link`, ajouté en v2) peut être surchargée à l'exécution, sans recompilation : soit ponctuellement via `p_db_link` sur `SYNC_ALL`/`SYNC_TABLE`/`SYNC_TABLES`/`CHECK_COMPATIBILITY`, soit pour toute la session via `SET_DB_LINK` (`GET_DB_LINK` restitue la valeur active ; `NULL` = mode « même instance », sans DB LINK). La sentinelle `C_DB_LINK_KEEP_CURRENT` (valeur par défaut) signifie « ne rien changer à la valeur courante ». Un paramètre invalide (`p_error_mode` hors périmètre, `p_db_link` malformé, `p_sync_mode` inconnu, `p_keep_days <= 0`) est rejeté en entrée (`E_INVALID_PARAMETER`, ou `-20010` pour un identifiant SQL non conforme), **avant** tout effet de bord.
+
+`SYNC_TABLES(p_table_list, ...)` (v3) synchronise une liste de tables en étendant automatiquement le périmètre aux parents FK nécessaires (cf. § 3.9). Le type public `t_tab_name_list` s'utilise par exemple : `PKG_SCHEMA_SYNC.SYNC_TABLES(p_table_list => PKG_SCHEMA_SYNC.t_tab_name_list('COMMANDE_LIGNE'));`
 
 `PURGE_HISTORY(p_keep_days)` (implémenté en v2) purge les tables d'audit à croissance illimitée : `SYNC_CONFLICT` (base `RESOLVED_DATE`), `SYNC_COMPATIBILITY_REPORT` (base `CHECK_DATE`), puis `SYNC_LOG`/`SYNC_RUN_HEADER` (base `START_DATE`, l'en-tête n'étant supprimé que si plus aucun log ne s'y rattache). `p_keep_days <= 0` est refusé : une purge totale doit rester une décision explicite hors du mode de maintenance.
 
-> **Point d'attention** — `SYNC_TABLE` ne traite que la table demandée, jamais le reste de sa grappe de dépendances FK. Si la table appartient à une grappe de plusieurs tables, cela peut introduire une incohérence référentielle transitoire. À réserver aux rattrapages ciblés ; préférer `SYNC_ALL` pour un traitement cohérent de grappe complète.
+> **Point d'attention** — `SYNC_TABLE` ne traite que la table demandée, jamais le reste de sa grappe de dépendances FK. Si la table appartient à une grappe de plusieurs tables, cela peut introduire une incohérence référentielle transitoire. À réserver aux rattrapages ciblés ; préférer `SYNC_ALL` (grappe complète) ou `SYNC_TABLES` (périmètre étendu aux parents FK) pour un traitement cohérent.
 
 ### 4.4. Découverte des métadonnées
 
@@ -351,9 +402,9 @@ Ce document de spécifications accompagne les livrables techniques suivants, pro
 - **Script 3** — Spécification du package (`CREATE PACKAGE`)
 - **Script 4** — Corps du package (`CREATE PACKAGE BODY`)
 - **Script 5** — Tables métier d'exemple, données et configuration (+ prérequis `GRANT EXECUTE ON DBMS_CRYPTO`)
-- **Script 6** — Jeu de tests fonctionnels guidés (16 scénarios)
+- **Script 6** — Jeu de tests fonctionnels guidés (18 scénarios)
 - **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL, non destructif)
-- **Script 8** — Migration v1 → v2 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT)
+- **Script 8** — Migration v1 → v2/v3 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT, `SYNC_MODE` / `RUN_TYPE`)
 
 ---
 
@@ -368,3 +419,16 @@ Récapitulatif des correctifs et durcissements apportés en v2 par rapport au do
 - **Cycle de vie / robustesse** : `PURGE_HISTORY` implémenté (rétention configurable) ; `compute_run_clusters` aligné sur les constantes d'`ISSUE_TYPE` ; compteurs de `SYNC_ALL` corrigés (tables actives vs exclues) ; `ROLLBACK` de l'en-tête en cas d'échec global ; validation des paramètres d'entrée (`p_error_mode`, `p_db_link`, `p_keep_days`) **avant** tout effet de bord (corrige la corruption de `g_db_link_b` de session par un `p_db_link` invalide).
 - **Surcharge du DB LINK sans recompilation** : `SET_DB_LINK` / `GET_DB_LINK` et paramètre `p_db_link` sur l'API.
 - **Tests / documentation** : Script 6 enrichi et scindé pour les étapes DDL manuelles, test de découverte non destructif (snapshot/restauration), nouveau harnais Script 7, README resynchronisé.
+
+---
+
+## 8. Changelog v3
+
+Évolutions fonctionnelles apportées en v3 :
+
+- **Mode de synchronisation** : colonne `SYNC_MODE` sur `SYNC_TABLE_CONFIG` (`INSERT` / `UPDATE` / `INSERT_UPDATE`, défaut `INSERT_UPDATE`, contrainte `CK_STC_SYNC_MODE`) et override ponctuel `p_sync_mode` sur `SYNC_ALL`/`SYNC_TABLE`/`SYNC_TABLES` (sentinelle `C_SYNC_MODE_KEEP_CURRENT`). Le mode effectif est journalisé dans `SYNC_LOG.SYNC_MODE` ; un mode inconnu est rejeté (`E_INVALID_PARAMETER`, `-20011`).
+- **Périmètre par liste + expansion FK** : nouvelle procédure `SYNC_TABLES(p_table_list …)` s'appuyant sur le type public `t_tab_name_list` ; fermeture transitive des **parents** FK configurés et actifs, exécution par grappes dans l'ordre topologique (parents avant enfants). `RUN_TYPE` élargi à `SYNC_TABLES`.
+- **CHECK_COMPATIBILITY sur liste** : surcharge acceptant `t_tab_name_list`, contrôle d'un sous-ensemble de tables en un seul `CHECK_ID` (cœur factorisé `compat_check_core`).
+- **Refactoring interne** : phase d'exécution des grappes factorisée (`execute_clusters`) entre `SYNC_ALL` et `SYNC_TABLES` ; résolution du mode effectif (`resolve_effective_mode`) et expansion des ancêtres FK (`expand_fk_ancestors`).
+- **Migration** : Script 8 étendu (idempotent) — ajout de `SYNC_TABLE_CONFIG.SYNC_MODE`, `SYNC_LOG.SYNC_MODE` et élargissement de `CK_SRH_RUN_TYPE`.
+- **Tests** : harnais Script 7 porté à 8 sections et 36 assertions (dont mode + expansion FK) ; Script 6 enrichi des scénarios `SYNC_TABLES` et `SYNC_MODE`. Validation : run réel `SYNC_TABLES(['COMMANDE_LIGNE'])` → 4 tables synchronisées `SUCCESS`.

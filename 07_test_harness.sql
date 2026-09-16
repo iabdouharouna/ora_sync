@@ -101,6 +101,27 @@ BEGIN
     T_HARNESS.ASSERT_TRUE('Au moins une table active configuree', v_active_cfg >= 1,
         'COUNT=' || v_active_cfg);
 
+    -- Evolutions v3 : colonne SYNC_MODE et sa contrainte
+    SELECT COUNT(*) INTO v_tables_audit
+      FROM USER_TAB_COLUMNS
+     WHERE TABLE_NAME = 'SYNC_TABLE_CONFIG' AND COLUMN_NAME = 'SYNC_MODE';
+    T_HARNESS.ASSERT_TRUE('Colonne SYNC_MODE presente dans SYNC_TABLE_CONFIG',
+        v_tables_audit = 1, 'COUNT=' || v_tables_audit);
+
+    SELECT COUNT(*) INTO v_tables_audit
+      FROM USER_CONSTRAINTS
+     WHERE CONSTRAINT_NAME = 'CK_STC_SYNC_MODE';
+    T_HARNESS.ASSERT_TRUE('Contrainte CK_STC_SYNC_MODE presente',
+        v_tables_audit = 1, 'COUNT=' || v_tables_audit);
+
+    -- RUN_TYPE doit accepter SYNC_TABLES (contrainte CK_SRH_RUN_TYPE mise a jour)
+    SELECT COUNT(*) INTO v_tables_audit
+      FROM USER_CONSTRAINTS c
+     WHERE c.CONSTRAINT_NAME = 'CK_SRH_RUN_TYPE'
+       AND INSTR(c.SEARCH_CONDITION_VC, 'SYNC_TABLES') > 0;
+    T_HARNESS.ASSERT_TRUE('CK_SRH_RUN_TYPE accepte SYNC_TABLES',
+        v_tables_audit = 1, 'COUNT=' || v_tables_audit);
+
     T_HARNESS.RESULT('objet');
 END;
 /
@@ -291,6 +312,131 @@ BEGIN
     T_HARNESS.ASSERT_TRUE('PURGE_HISTORY(365) execute sans erreur', TRUE);
 
     T_HARNESS.RESULT('purge');
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Bloc 7 : mode de synchronisation (SYNC_MODE par table + override de run)
+--------------------------------------------------------------------------------
+DECLARE
+    v_run_id    NUMBER;
+    v_mode      VARCHAR2(20);
+    v_err       VARCHAR2(2000);
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('== Bloc 7 : mode de synchronisation (SYNC_MODE) ==');
+
+    -- Défaut de configuration : SYNC_TABLE SANS p_sync_mode -> le mode
+    -- résolu doit être INSERT_UPDATE (défaut de la colonne SYNC_MODE).
+    PKG_SCHEMA_SYNC.SYNC_TABLE('CLIENT', p_dry_run => TRUE, p_run_id => v_run_id);
+    T_HARNESS.ASSERT_TRUE('SYNC_TABLE CLIENT (dry, sans mode) execute sans erreur',
+        v_run_id IS NOT NULL);
+
+    SELECT sync_mode INTO v_mode FROM SYNC_LOG
+     WHERE run_id = v_run_id AND table_name = 'CLIENT' AND ROWNUM = 1;
+    T_HARNESS.ASSERT_TRUE('Mode par defaut = INSERT_UPDATE (sans override)',
+        v_mode = 'INSERT_UPDATE', 'mode=' || NVL(v_mode, '<null>'));
+
+    -- Override de run : SYNC_TABLE en mode INSERT (dry) -> SYNC_LOG trace le
+    -- mode effectif de la table (evolutions v3).
+    PKG_SCHEMA_SYNC.SYNC_TABLE('COMMANDE', p_dry_run => TRUE,
+        p_sync_mode => PKG_SCHEMA_SYNC.C_SYNC_MODE_INSERT, p_run_id => v_run_id);
+    T_HARNESS.ASSERT_TRUE('SYNC_TABLE COMMANDE (dry, mode INSERT) execute sans erreur',
+        v_run_id IS NOT NULL);
+
+    SELECT sync_mode INTO v_mode FROM SYNC_LOG
+     WHERE run_id = v_run_id AND table_name = 'COMMANDE' AND ROWNUM = 1;
+    T_HARNESS.ASSERT_TRUE('SYNC_LOG.SYNC_MODE = INSERT (mode effectif journalise)',
+        v_mode = 'INSERT', 'mode=' || NVL(v_mode, '<null>'));
+
+    -- L'override de run ne doit PAS persister dans la configuration.
+    SELECT sync_mode INTO v_mode FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE';
+    T_HARNESS.ASSERT_TRUE('Override de run non persiste (config COMMANDE = INSERT_UPDATE)',
+        v_mode = 'INSERT_UPDATE', 'mode=' || NVL(v_mode, '<null>'));
+
+    -- p_sync_mode inconnu -> E_INVALID_PARAMETER (-20011)
+    BEGIN
+        PKG_SCHEMA_SYNC.SYNC_ALL(p_dry_run => TRUE, p_sync_mode => 'DUP', p_run_id => v_run_id);
+        v_err := NULL;
+    EXCEPTION
+        WHEN PKG_SCHEMA_SYNC.E_INVALID_PARAMETER THEN
+            v_err := SQLERRM;
+        WHEN OTHERS THEN
+            v_err := 'AUTRE_ERREUR: ' || SQLERRM;
+    END;
+    T_HARNESS.ASSERT_TRUE('p_sync_mode invalide rejete (E_INVALID_PARAMETER)',
+        v_err IS NOT NULL AND INSTR(v_err, '-20011') > 0, v_err);
+
+    T_HARNESS.RESULT('mode');
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Bloc 8 : SYNC_TABLES + résolution implicite des dépendances FK (parents)
+--
+-- Le jeu d'exemple porte la chaîne CLIENT <- COMMANDE <- COMMANDE_LIGNE et
+-- PRODUIT <- COMMANDE_LIGNE. En ne demandant QUE COMMANDE_LIGNE, la fermeture
+-- transitive des parents doit injecter COMMANDE, PRODUIT et CLIENT : le run
+-- (en dry) couvre donc 4 tables. C'est le cœur de la nouvelle feature.
+--------------------------------------------------------------------------------
+DECLARE
+    v_run_id     NUMBER;
+    v_run_type   VARCHAR2(20);
+    v_total      NUMBER;
+    v_status     VARCHAR2(30);
+    v_cnt        NUMBER;
+    v_check_id   NUMBER;
+    v_blocking   BOOLEAN;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('== Bloc 8 : SYNC_TABLES + expansion FK (parents) ==');
+
+    PKG_SCHEMA_SYNC.SYNC_TABLES(
+        p_table_list => PKG_SCHEMA_SYNC.t_tab_name_list('COMMANDE_LIGNE'),
+        p_dry_run    => TRUE,
+        p_run_id     => v_run_id
+    );
+    T_HARNESS.ASSERT_TRUE('SYNC_TABLES(COMMANDE_LIGNE) dry execute sans erreur',
+        v_run_id IS NOT NULL);
+
+    SELECT run_type, total_tables, status INTO v_run_type, v_total, v_status
+      FROM SYNC_RUN_HEADER WHERE run_id = v_run_id;
+    T_HARNESS.ASSERT_TRUE('RUN_TYPE = SYNC_TABLES', v_run_type = 'SYNC_TABLES',
+        'run_type=' || v_run_type);
+    T_HARNESS.ASSERT_TRUE('Statut de run coherent (pas FAILED)',
+        v_status IN ('SUCCESS','SUCCESS_WITH_CONFLICTS','PARTIAL'), 'status=' || v_status);
+
+    -- Expansion FK : 1 table demandee -> 4 tables executees (parents implicites).
+    T_HARNESS.ASSERT_TRUE('total_tables = 4 (COMMANDE_LIGNE + PRODUIT + COMMANDE + CLIENT)',
+        v_total = 4, 'total=' || v_total);
+
+    SELECT COUNT(*) INTO v_cnt FROM SYNC_LOG WHERE run_id = v_run_id
+      AND table_name IN ('CLIENT','COMMANDE','PRODUIT','COMMANDE_LIGNE');
+    T_HARNESS.ASSERT_TRUE('SYNC_LOG couvre les 4 tables du perimetre etendu',
+        v_cnt = 4, 'nb=' || v_cnt);
+
+    SELECT COUNT(*) INTO v_cnt FROM SYNC_LOG WHERE run_id = v_run_id
+      AND table_name NOT IN ('CLIENT','COMMANDE','PRODUIT','COMMANDE_LIGNE');
+    T_HARNESS.ASSERT_TRUE('Aucune table hors perimetre dans le run', v_cnt = 0, 'nb=' || v_cnt);
+
+    -- Une table sans parent doit rester seule (CLIENT n'a pas de parent FK).
+    PKG_SCHEMA_SYNC.SYNC_TABLES(
+        p_table_list => PKG_SCHEMA_SYNC.t_tab_name_list('CLIENT'),
+        p_dry_run    => TRUE,
+        p_run_id     => v_run_id
+    );
+    SELECT total_tables INTO v_total FROM SYNC_RUN_HEADER WHERE run_id = v_run_id;
+    T_HARNESS.ASSERT_TRUE('SYNC_TABLES(CLIENT) : total = 1 (aucun parent)',
+        v_total = 1, 'total=' || v_total);
+
+    -- Surcharge CHECK_COMPATIBILITY sur liste (type public t_tab_name_list).
+    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(
+        p_table_list          => PKG_SCHEMA_SYNC.t_tab_name_list('COMMANDE','CLIENT'),
+        p_check_id            => v_check_id,
+        p_has_blocking_issues => v_blocking
+    );
+    T_HARNESS.ASSERT_TRUE('CHECK_COMPATIBILITY(liste) execute (check_id <> null)',
+        v_check_id IS NOT NULL, 'check_id=' || NVL(TO_CHAR(v_check_id), '<null>'));
+
+    T_HARNESS.RESULT('sync_tables');
 END;
 /
 

@@ -498,6 +498,25 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     --------------------------------------------------------------------------
+    -- validate_sync_mode
+    --
+    -- Rôle : valide la valeur du paramètre p_sync_mode d'un run (sentinelle
+    --        "garder le mode configuré par table" ou l'un des trois modes
+    --        fonctionnels). Lève E_INVALID_PARAMETER (-20011) sinon. La
+    --        valeur NULL est acceptée et traitée comme la sentinelle.
+    --------------------------------------------------------------------------
+    PROCEDURE validate_sync_mode(p_sync_mode IN VARCHAR2) IS
+    BEGIN
+        IF p_sync_mode IS NOT NULL AND p_sync_mode != C_SYNC_MODE_KEEP_CURRENT
+           AND p_sync_mode NOT IN (C_SYNC_MODE_INSERT, C_SYNC_MODE_UPDATE, C_SYNC_MODE_INSERT_UPDATE) THEN
+            RAISE_APPLICATION_ERROR(-20011,
+                'Parametre p_sync_mode invalide : [' || p_sync_mode || '] (attendu : '
+                || C_SYNC_MODE_INSERT || ', ' || C_SYNC_MODE_UPDATE || ' ou ' || C_SYNC_MODE_INSERT_UPDATE || ')');
+        END IF;
+    END validate_sync_mode;
+
+
+    --------------------------------------------------------------------------
     -- b_link_suffix
     --
     -- Rôle : centralise la décision "faut-il qualifier les références à
@@ -889,15 +908,20 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     END get_sync_columns;
 
     --------------------------------------------------------------------------
-    -- CHECK_COMPATIBILITY (procédure publique) — cf. Script 3 pour la doc
-    -- fonctionnelle complète. Règles de sévérité résumées dans les
-    -- commentaires du corps ci-dessous.
+    -- compat_check_core (privée)
+    --
+    -- Rôle : cœur du contrôle de compatibilité, partagé par les deux
+    --        surcharges publiques CHECK_COMPATIBILITY (nom unique, ou NULL
+    --        pour tout le périmètre ; et liste explicite de tables). Boucle
+    --        sur une collection de NOMS (p_table_names), génère un CHECK_ID
+    --        unique, remplit SYNC_COMPATIBILITY_REPORT et retourne un flag
+    --        "présence d'au moins une anomalie BLOCKING". Règles de sévérité
+    --        résumées dans le corps ci-dessous (identique à la v1/v2).
     --------------------------------------------------------------------------
-    PROCEDURE CHECK_COMPATIBILITY (
-        p_table_name            IN  VARCHAR2 DEFAULT NULL,
-        p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
-        p_check_id              OUT NUMBER,
-        p_has_blocking_issues   OUT BOOLEAN
+    PROCEDURE compat_check_core(
+        p_table_names      IN t_str_tab,
+        p_check_id         OUT NUMBER,
+        p_has_blocking     OUT BOOLEAN
     ) IS
         v_check_id      NUMBER := SYNC_COMPAT_CHECK_ID_SEQ.NEXTVAL;
         v_blocking      BOOLEAN := FALSE;
@@ -909,29 +933,20 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_keys_equal    BOOLEAN := TRUE;
         v_detail_a      VARCHAR2(4000) := '';
         v_detail_b      VARCHAR2(4000) := '';
-
-        CURSOR c_tables IS
-            SELECT table_name FROM SYNC_TABLE_CONFIG
-            WHERE (p_table_name IS NULL OR table_name = p_table_name)
-              AND enabled = 'Y';
+        v_cur_table     VARCHAR2(128);
     BEGIN
-        -- Correctif v2 : valider AVANT d'appliquer l'override (p_error_mode
-        -- passé en CONTINUE car CHECK_COMPATIBILITY n'a pas de mode d'erreur :
-        -- seule la validation de p_db_link nous intéresse ici).
-        validate_common_params(C_ERROR_MODE_CONTINUE, p_db_link);
-        apply_db_link_override(p_db_link);
+        FOR t_idx IN 1 .. p_table_names.COUNT LOOP
+            v_cur_table := p_table_names(t_idx);
 
-        FOR t IN c_tables LOOP
-
-            IF NOT table_exists(C_SCHEMA_A, t.table_name, NULL) THEN
-                insert_compat_report(v_check_id, t.table_name, NULL, 'MISSING_IN_A', C_SEVERITY_BLOCKING,
+            IF NOT table_exists(C_SCHEMA_A, v_cur_table, NULL) THEN
+                insert_compat_report(v_check_id, v_cur_table, NULL, 'MISSING_IN_A', C_SEVERITY_BLOCKING,
                     'Table absente', 'Table presente');
                 v_blocking := TRUE;
                 CONTINUE;
             END IF;
 
-            IF NOT table_exists(C_SCHEMA_B, t.table_name, g_db_link_b) THEN
-                insert_compat_report(v_check_id, t.table_name, NULL, 'MISSING_IN_B', C_SEVERITY_BLOCKING,
+            IF NOT table_exists(C_SCHEMA_B, v_cur_table, g_db_link_b) THEN
+                insert_compat_report(v_check_id, v_cur_table, NULL, 'MISSING_IN_B', C_SEVERITY_BLOCKING,
                     'Table presente', 'Table absente');
                 v_blocking := TRUE;
                 CONTINUE;
@@ -943,27 +958,27 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             -- Corrige le défaut v1 qui rabattait TOUT échec sur PK_MISSING :
             -- une clé configurée non unique doit lever KEY_NOT_UNIQUE.
             ------------------------------------------------------------------
-            v_key         := get_primary_or_unique_key(t.table_name);
+            v_key         := get_primary_or_unique_key(v_cur_table);
             v_from_config := (v_key.COUNT = 0);
             IF v_from_config THEN
-                v_key := get_configured_key(t.table_name);
+                v_key := get_configured_key(v_cur_table);
             END IF;
 
             IF v_key.COUNT = 0 THEN
-                insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISSING', C_SEVERITY_BLOCKING,
+                insert_compat_report(v_check_id, v_cur_table, NULL, 'PK_MISSING', C_SEVERITY_BLOCKING,
                     'Aucune cle exploitable (ni PK/UNIQUE Oracle, ni SYNC_KEY_CONFIG)', NULL);
                 v_blocking := TRUE;
                 CONTINUE;
             END IF;
 
             IF v_from_config THEN
-                IF NOT validate_key_uniqueness(t.table_name, v_key, C_SCHEMA_A, NULL) THEN
-                    insert_compat_report(v_check_id, t.table_name, NULL, 'KEY_NOT_UNIQUE', C_SEVERITY_BLOCKING,
+                IF NOT validate_key_uniqueness(v_cur_table, v_key, C_SCHEMA_A, NULL) THEN
+                    insert_compat_report(v_check_id, v_cur_table, NULL, 'KEY_NOT_UNIQUE', C_SEVERITY_BLOCKING,
                         'Cle configuree non unique en pratique cote SCHEMA_A', NULL);
                     v_blocking := TRUE;
                     CONTINUE;
-                ELSIF NOT validate_key_uniqueness(t.table_name, v_key, C_SCHEMA_B, g_db_link_b) THEN
-                    insert_compat_report(v_check_id, t.table_name, NULL, 'KEY_NOT_UNIQUE', C_SEVERITY_BLOCKING,
+                ELSIF NOT validate_key_uniqueness(v_cur_table, v_key, C_SCHEMA_B, g_db_link_b) THEN
+                    insert_compat_report(v_check_id, v_cur_table, NULL, 'KEY_NOT_UNIQUE', C_SEVERITY_BLOCKING,
                         'Cle configuree non unique en pratique cote SCHEMA_B', NULL);
                     v_blocking := TRUE;
                     CONTINUE;
@@ -973,7 +988,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             ------------------------------------------------------------------
             -- Conformité de la clé entre A et B (PK_MISMATCH, absent de la v1)
             ------------------------------------------------------------------
-            v_key_b := get_primary_or_unique_key_for_owner(C_SCHEMA_B, t.table_name, g_db_link_b);
+            v_key_b := get_primary_or_unique_key_for_owner(C_SCHEMA_B, v_cur_table, g_db_link_b);
 
             v_keys_equal := TRUE;
             IF v_key.COUNT != v_key_b.COUNT THEN
@@ -1000,16 +1015,16 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 IF v_key_b.COUNT = 0 THEN
                     -- B ne porte aucune contrainte de clé : la correspondance
                     -- reste possible via la clé A, simple signal d'attention.
-                    insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISMATCH', C_SEVERITY_WARNING,
+                    insert_compat_report(v_check_id, v_cur_table, NULL, 'PK_MISMATCH', C_SEVERITY_WARNING,
                         'Cle en A : ' || v_detail_a || ' (B sans PK/UNIQUE)', v_detail_b);
                 ELSE
-                    insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISMATCH', C_SEVERITY_BLOCKING,
+                    insert_compat_report(v_check_id, v_cur_table, NULL, 'PK_MISMATCH', C_SEVERITY_BLOCKING,
                         'Cle en A : ' || v_detail_a, 'Cle en B : ' || v_detail_b);
                     v_blocking := TRUE;
                 END IF;
             END IF;
 
-            v_compare := get_column_comparison(t.table_name);
+            v_compare := get_column_comparison(v_cur_table);
 
             FOR i IN 1 .. v_compare.COUNT LOOP
 
@@ -1021,7 +1036,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 END LOOP;
 
                 IF v_compare(i).a_data_type IS NULL THEN
-                    insert_compat_report(v_check_id, t.table_name, v_compare(i).column_name,
+                    insert_compat_report(v_check_id, v_cur_table, v_compare(i).column_name,
                         'MISSING_IN_A', CASE WHEN v_is_key THEN C_SEVERITY_BLOCKING ELSE C_SEVERITY_WARNING END,
                         NULL, v_compare(i).b_data_type);
                     IF v_is_key THEN v_blocking := TRUE; END IF;
@@ -1029,7 +1044,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 END IF;
 
                 IF v_compare(i).b_data_type IS NULL THEN
-                    insert_compat_report(v_check_id, t.table_name, v_compare(i).column_name,
+                    insert_compat_report(v_check_id, v_cur_table, v_compare(i).column_name,
                         'MISSING_IN_B', CASE WHEN v_is_key THEN C_SEVERITY_BLOCKING ELSE C_SEVERITY_WARNING END,
                         v_compare(i).a_data_type, NULL);
                     IF v_is_key THEN v_blocking := TRUE; END IF;
@@ -1038,7 +1053,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
                 IF NOT is_type_supported(v_compare(i).a_data_type, v_compare(i).a_type_owner)
                    OR NOT is_type_supported(v_compare(i).b_data_type, v_compare(i).b_type_owner) THEN
-                    insert_compat_report(v_check_id, t.table_name, v_compare(i).column_name,
+                    insert_compat_report(v_check_id, v_cur_table, v_compare(i).column_name,
                         'UNSUPPORTED_TYPE', CASE WHEN v_is_key THEN C_SEVERITY_BLOCKING ELSE C_SEVERITY_WARNING END,
                         v_compare(i).a_data_type, v_compare(i).b_data_type);
                     IF v_is_key THEN v_blocking := TRUE; END IF;
@@ -1046,7 +1061,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 END IF;
 
                 IF v_compare(i).a_data_type != v_compare(i).b_data_type THEN
-                    insert_compat_report(v_check_id, t.table_name, v_compare(i).column_name,
+                    insert_compat_report(v_check_id, v_cur_table, v_compare(i).column_name,
                         'TYPE_MISMATCH', C_SEVERITY_BLOCKING,
                         v_compare(i).a_data_type, v_compare(i).b_data_type);
                     v_blocking := TRUE;
@@ -1056,7 +1071,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 IF NVL(v_compare(i).a_data_length, -1)     != NVL(v_compare(i).b_data_length, -1)
                    OR NVL(v_compare(i).a_data_precision, -1) != NVL(v_compare(i).b_data_precision, -1)
                    OR NVL(v_compare(i).a_data_scale, -1)     != NVL(v_compare(i).b_data_scale, -1) THEN
-                    insert_compat_report(v_check_id, t.table_name, v_compare(i).column_name,
+                    insert_compat_report(v_check_id, v_cur_table, v_compare(i).column_name,
                         'LENGTH_MISMATCH', C_SEVERITY_BLOCKING,
                         v_compare(i).a_data_type || '(' || v_compare(i).a_data_length || ')',
                         v_compare(i).b_data_type || '(' || v_compare(i).b_data_length || ')');
@@ -1065,7 +1080,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 END IF;
 
                 IF NVL(v_compare(i).a_nullable, 'Y') != NVL(v_compare(i).b_nullable, 'Y') THEN
-                    insert_compat_report(v_check_id, t.table_name, v_compare(i).column_name,
+                    insert_compat_report(v_check_id, v_cur_table, v_compare(i).column_name,
                         'NULLABLE_MISMATCH', C_SEVERITY_WARNING,
                         v_compare(i).a_nullable, v_compare(i).b_nullable);
                 END IF;
@@ -1075,7 +1090,61 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END LOOP;
 
         p_check_id := v_check_id;
-        p_has_blocking_issues := v_blocking;
+        p_has_blocking := v_blocking;
+    END compat_check_core;
+
+    --------------------------------------------------------------------------
+    -- CHECK_COMPATIBILITY (procédures publiques) — cf. Script 3 pour la doc
+    -- fonctionnelle complète. Deux surcharges :
+    --   1) p_table_name : une table précise, ou NULL pour tout le périmètre
+    --      configuré et actif (cas de SYNC_ALL) ;
+    --   2) p_table_list : contrôle d'une LISTE EXPLICITE de tables
+    --      (type public t_tab_name_list), sans exigence d'activation config —
+    --      utile pour pré-valider. Même règles de sévérité, un CHECK_ID par
+    --      appel.
+    --------------------------------------------------------------------------
+    PROCEDURE CHECK_COMPATIBILITY (
+        p_table_name            IN  VARCHAR2 DEFAULT NULL,
+        p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+        p_check_id              OUT NUMBER,
+        p_has_blocking_issues   OUT BOOLEAN
+    ) IS
+        v_names t_str_tab;
+    BEGIN
+        -- Correctif v2 : valider AVANT d'appliquer l'override (seule la
+        -- validation de p_db_link nous intéresse ici).
+        validate_common_params(C_ERROR_MODE_CONTINUE, p_db_link);
+        apply_db_link_override(p_db_link);
+
+        IF p_table_name IS NULL THEN
+            SELECT table_name BULK COLLECT INTO v_names
+            FROM SYNC_TABLE_CONFIG
+            WHERE enabled = 'Y';
+        ELSE
+            v_names(1) := p_table_name;
+        END IF;
+
+        compat_check_core(v_names, p_check_id, p_has_blocking_issues);
+    END CHECK_COMPATIBILITY;
+
+    PROCEDURE CHECK_COMPATIBILITY (
+        p_table_list            IN  t_tab_name_list,
+        p_db_link               IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+        p_check_id              OUT NUMBER,
+        p_has_blocking_issues   OUT BOOLEAN
+    ) IS
+        v_names t_str_tab;
+    BEGIN
+        validate_common_params(C_ERROR_MODE_CONTINUE, p_db_link);
+        apply_db_link_override(p_db_link);
+
+        IF p_table_list IS NOT NULL THEN
+            FOR i IN 1 .. p_table_list.COUNT LOOP
+                v_names(i) := p_table_list(i);
+            END LOOP;
+        END IF;
+
+        compat_check_core(v_names, p_check_id, p_has_blocking_issues);
     END CHECK_COMPATIBILITY;
 
     ----------------------------------------------------------------------
@@ -1090,6 +1159,110 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END LOOP;
         RETURN FALSE;
     END is_in_list;
+
+
+    --------------------------------------------------------------------------
+    -- resolve_effective_mode
+    --
+    -- Rôle : détermine le mode d'APPLICATION effectif d'une table pour un run.
+    --        Règle : si l'override de run p_override est renseigné (différent
+    --        de la sentinelle C_SYNC_MODE_KEEP_CURRENT), il s'applique à toutes
+    --        les tables (sans persistance) ; sinon c'est le SYNC_MODE configuré
+    --        dans SYNC_TABLE_CONFIG qui s'applique.
+    --------------------------------------------------------------------------
+    FUNCTION resolve_effective_mode(
+        p_table_name IN VARCHAR2,
+        p_override   IN VARCHAR2
+    ) RETURN VARCHAR2 IS
+        v_mode VARCHAR2(20);
+    BEGIN
+        IF p_override IS NOT NULL AND p_override != C_SYNC_MODE_KEEP_CURRENT THEN
+            RETURN p_override;
+        END IF;
+
+        SELECT sync_mode INTO v_mode
+        FROM SYNC_TABLE_CONFIG
+        WHERE table_name = p_table_name;
+        RETURN v_mode;
+    END resolve_effective_mode;
+
+
+    --------------------------------------------------------------------------
+    -- expand_fk_ancestors
+    --
+    -- Rôle : reçoit un ensemble de tables (déjà validées comme actives) et
+    --        retourne cet ensemble ∪ sa FERMETURE TRANSITIVE DES PARENTS FK
+    --        (ancêtres via les contraintes FK de SCHEMA_A), restreints aux
+    --        tables de SYNC_TABLE_CONFIG actives (ENABLED='Y' et
+    --        SYNC_DIRECTION != 'DISABLED'). Un parent hors configuration est
+    --        ignoré : hors périmètre de la synchronisation, il ne peut pas
+    --        être ajouté de force (décision de conception, cf. spécification
+    --        de SYNC_TABLES).
+    --
+    -- Implémentation : expansion itérative par fronts (fichiers parents des
+    --        tables déjà retenues), jusqu'à point fixe (au plus 50 passes de
+    --        garde — un cycle FK est traité par la détection de grappes/cycle
+    --        existante, cette fonction ne boucle que sur la découverte).
+    --        Ordre de sortie déterministe : tables demandées dans leur ordre,
+    --        puis ancêtres dans l'ordre de découverte.
+    --------------------------------------------------------------------------
+    FUNCTION expand_fk_ancestors(p_tables IN t_str_tab) RETURN t_str_tab IS
+        TYPE t_set IS TABLE OF VARCHAR2(128) INDEX BY VARCHAR2(128);
+
+        v_result    t_str_tab;
+        v_present   t_set;
+        v_count     PLS_INTEGER := 0;
+        v_new       PLS_INTEGER;
+        v_cfg       NUMBER;
+    BEGIN
+        -- 1) Copie dédupliquée des tables demandées (ordre conservé).
+        FOR i IN 1 .. p_tables.COUNT LOOP
+            IF NOT v_present.EXISTS(p_tables(i)) THEN
+                v_count := v_count + 1;
+                v_result(v_count) := p_tables(i);
+                v_present(p_tables(i)) := p_tables(i);
+            END IF;
+        END LOOP;
+
+        -- 2) Fermeture transitive des parents (re-scan complet à chaque passe :
+        --    volumétrie faible, clarté garantie).
+        FOR pass IN 1 .. 50 LOOP
+            v_new := 0;
+            FOR f IN 1 .. v_count LOOP
+                FOR rec IN (
+                    SELECT DISTINCT r.table_name AS parent_table
+                    FROM ALL_CONSTRAINTS c
+                    JOIN ALL_CONSTRAINTS r
+                      ON c.r_constraint_name = r.constraint_name
+                     AND c.r_owner = r.owner
+                    WHERE c.owner = C_SCHEMA_A
+                      AND c.constraint_type = 'R'
+                      AND c.status = 'ENABLED'
+                      AND r.constraint_type IN ('P', 'U')
+                      AND c.table_name = v_result(f)
+                )
+                LOOP
+                    IF NOT v_present.EXISTS(rec.parent_table) THEN
+                        SELECT COUNT(*) INTO v_cfg
+                        FROM SYNC_TABLE_CONFIG
+                        WHERE table_name = rec.parent_table
+                          AND enabled = 'Y'
+                          AND sync_direction != C_DIRECTION_DISABLED;
+
+                        IF v_cfg = 1 THEN
+                            v_count := v_count + 1;
+                            v_result(v_count) := rec.parent_table;
+                            v_present(rec.parent_table) := rec.parent_table;
+                            v_new := v_new + 1;
+                        END IF;
+                    END IF;
+                END LOOP;
+            END LOOP;
+            EXIT WHEN v_new = 0;
+        END LOOP;
+
+        RETURN v_result;
+    END expand_fk_ancestors;
 
 
     ----------------------------------------------------------------------
@@ -1572,6 +1745,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_key_cols          IN  t_str_tab,
         p_columns           IN  t_column_tab,
         p_dry_run           IN  BOOLEAN,
+        p_sync_mode         IN  VARCHAR2,
         p_rows_inserted     OUT NUMBER,
         p_rows_updated      OUT NUMBER
     ) IS
@@ -1581,14 +1755,39 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_table     VARCHAR2(128) := sanitize_ident(p_table_name);
         v_types     t_coltype_tab := type_map_from_columns(p_columns);
         v_sql       VARCHAR2(4000);
+        v_ins       NUMBER;
+        v_upd       NUMBER;
+        v_diff_list VARCHAR2(120);
     BEGIN
-        SELECT COUNT(*) INTO p_rows_inserted FROM SYNC_WORK_DIFF
+        SELECT COUNT(*) INTO v_ins FROM SYNC_WORK_DIFF
             WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'INSERT_TO_A';
-        SELECT COUNT(*) INTO p_rows_updated FROM SYNC_WORK_DIFF
+        SELECT COUNT(*) INTO v_upd FROM SYNC_WORK_DIFF
             WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'UPDATE_TO_A';
+
+        -- Filtrage par mode : les opérations hors mode sont comptées 0 et ne
+        -- sont pas appliquées (v_diff_list ci-dessous restreint la source).
+        p_rows_inserted := v_ins;
+        p_rows_updated  := v_upd;
+        IF p_sync_mode = C_SYNC_MODE_UPDATE THEN
+            p_rows_inserted := 0;
+        ELSIF p_sync_mode = C_SYNC_MODE_INSERT THEN
+            p_rows_updated := 0;
+        END IF;
 
         IF p_dry_run OR (p_rows_inserted = 0 AND p_rows_updated = 0) THEN
             RETURN; -- rien à appliquer réellement, ou simulation : comptes déjà connus
+        END IF;
+
+        -- Restrictions source par mode. Un MERGE classe MATCHED/NOT MATCHED par
+        -- l'état réel de la cible : restreindre la source aux seules clés autorisées
+        -- (INSERT_TO_A ≡ non présente en A -> NOT MATCHED ; UPDATE_TO_A ≡ présente
+        -- -> MATCHED) rend l'autre branche inerte sans changer sa syntaxe.
+        IF p_sync_mode = C_SYNC_MODE_INSERT THEN
+            v_diff_list := '(''INSERT_TO_A'')';
+        ELSIF p_sync_mode = C_SYNC_MODE_UPDATE THEN
+            v_diff_list := '(''UPDATE_TO_A'')';
+        ELSE
+            v_diff_list := '(''INSERT_TO_A'',''UPDATE_TO_A'')';
         END IF;
 
         build_column_lists(p_columns, p_key_cols, v_all_cols, v_set, v_src_cols);
@@ -1598,7 +1797,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             'USING (SELECT ' || v_all_cols || ' FROM ' || b_table_ref(p_table_name) ||
             ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL, v_types) ||
             ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :tn ' ||
-            '     AND direction = :dir)) src ' ||
+            '     AND direction = :dir AND diff_type IN ' || v_diff_list || ')) src ' ||
             'ON (' || build_on_clause(p_key_cols, 'tgt', 'src') || ') ' ||
             'WHEN MATCHED THEN UPDATE SET ' || v_set || ' ' ||
             'WHEN NOT MATCHED THEN INSERT (' || v_all_cols || ') VALUES (' || v_src_cols || ')';
@@ -1639,6 +1838,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_key_cols          IN  t_str_tab,
         p_columns           IN  t_column_tab,
         p_dry_run           IN  BOOLEAN,
+        p_sync_mode         IN  VARCHAR2,
         p_rows_inserted     OUT NUMBER,
         p_rows_updated      OUT NUMBER
     ) IS
@@ -1651,11 +1851,21 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_non_key_cols VARCHAR2(4000);
         v_select_non_key VARCHAR2(4000);
         v_is_key BOOLEAN;
+        v_ins       NUMBER;
+        v_upd       NUMBER;
+        v_apply_ins BOOLEAN;
+        v_apply_upd BOOLEAN;
     BEGIN
-        SELECT COUNT(*) INTO p_rows_inserted FROM SYNC_WORK_DIFF
+        SELECT COUNT(*) INTO v_ins FROM SYNC_WORK_DIFF
             WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'INSERT_TO_B';
-        SELECT COUNT(*) INTO p_rows_updated FROM SYNC_WORK_DIFF
+        SELECT COUNT(*) INTO v_upd FROM SYNC_WORK_DIFF
             WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'UPDATE_TO_B';
+
+        -- Filtrage par mode : l'opération hors mode est comptée 0 et non exécutée.
+        v_apply_ins := p_sync_mode IN (C_SYNC_MODE_INSERT, C_SYNC_MODE_INSERT_UPDATE);
+        v_apply_upd := p_sync_mode IN (C_SYNC_MODE_UPDATE, C_SYNC_MODE_INSERT_UPDATE);
+        p_rows_inserted := CASE WHEN v_apply_ins THEN v_ins ELSE 0 END;
+        p_rows_updated  := CASE WHEN v_apply_upd THEN v_upd ELSE 0 END;
 
         IF p_dry_run OR (p_rows_inserted = 0 AND p_rows_updated = 0) THEN
             RETURN;
@@ -1664,9 +1874,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         build_column_lists(p_columns, p_key_cols, v_all_cols, v_set, v_src_cols);
 
         ------------------------------------------------------------------
-        -- 1) INSERT distribué
+        -- 1) INSERT distribué (uniquement si le mode l'autorise)
         ------------------------------------------------------------------
-        IF p_rows_inserted > 0 THEN
+        IF v_apply_ins AND p_rows_inserted > 0 THEN
             v_sql :=
                 'INSERT INTO ' || b_table_ref(p_table_name) ||
                 ' (' || v_all_cols || ') ' ||
@@ -1679,9 +1889,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END IF;
 
         ------------------------------------------------------------------
-        -- 2) UPDATE distribué (colonnes non-clé uniquement)
+        -- 2) UPDATE distribué (colonnes non-clé uniquement, mode autorisé)
         ------------------------------------------------------------------
-        IF p_rows_updated > 0 THEN
+        IF v_apply_upd AND p_rows_updated > 0 THEN
             v_non_key_cols := NULL;
             v_select_non_key := NULL;
             FOR i IN 1 .. p_columns.COUNT LOOP
@@ -1728,16 +1938,17 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_key_cols              IN  t_str_tab,
         p_columns                IN  t_column_tab,
         p_dry_run                IN  BOOLEAN,
+        p_sync_mode              IN  VARCHAR2,
         p_rows_inserted_a_to_b   OUT NUMBER,
         p_rows_inserted_b_to_a   OUT NUMBER,
         p_rows_updated_a_to_b    OUT NUMBER,
         p_rows_updated_b_to_a    OUT NUMBER
     ) IS
     BEGIN
-        apply_to_remote_target(p_run_id, p_table_name, p_key_cols, p_columns, p_dry_run,
+        apply_to_remote_target(p_run_id, p_table_name, p_key_cols, p_columns, p_dry_run, p_sync_mode,
             p_rows_inserted_a_to_b, p_rows_updated_a_to_b);
 
-        apply_to_local_target(p_run_id, p_table_name, p_key_cols, p_columns, p_dry_run,
+        apply_to_local_target(p_run_id, p_table_name, p_key_cols, p_columns, p_dry_run, p_sync_mode,
             p_rows_inserted_b_to_a, p_rows_updated_b_to_a);
     END apply_table_diffs;
 
@@ -2165,6 +2376,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_table_name    IN  VARCHAR2,
         p_cluster_id    IN  NUMBER,
         p_topo_order    IN  NUMBER,
+        p_sync_mode     IN  VARCHAR2,      -- override de run (sentinelle = suivre la config)
         p_dry_run       IN  BOOLEAN,
         p_status        OUT VARCHAR2
     ) IS
@@ -2176,9 +2388,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_upd_atb           NUMBER := 0;
         v_upd_bta           NUMBER := 0;
         v_conflict_count    NUMBER := 0;
+        v_eff_mode          VARCHAR2(20);
     BEGIN
-        INSERT INTO SYNC_LOG (log_id, run_id, table_name, status, cluster_id, cluster_order)
-        VALUES (v_log_id, p_run_id, p_table_name, C_STATUS_IN_PROGRESS, p_cluster_id, p_topo_order);
+        -- Mode d'application effectif : override de run, sinon SYNC_MODE configuré.
+        v_eff_mode := resolve_effective_mode(p_table_name, p_sync_mode);
+
+        INSERT INTO SYNC_LOG (log_id, run_id, table_name, status, cluster_id, cluster_order, sync_mode)
+        VALUES (v_log_id, p_run_id, p_table_name, C_STATUS_IN_PROGRESS, p_cluster_id, p_topo_order, v_eff_mode);
 
         v_key     := get_effective_key(p_table_name);
         v_columns := get_sync_columns(p_table_name, v_key);
@@ -2187,7 +2403,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         run_diagnostic(p_run_id, p_table_name);
         resolve_table_diffs(p_run_id, p_table_name, v_key);
 
-        apply_table_diffs(p_run_id, p_table_name, v_key, v_columns, p_dry_run,
+        apply_table_diffs(p_run_id, p_table_name, v_key, v_columns, p_dry_run, v_eff_mode,
             v_ins_atb, v_ins_bta, v_upd_atb, v_upd_bta);
 
         -- Nombre de conflits RÉELS journalisés pour cette table : les écarts
@@ -2266,6 +2482,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_cluster_tables    IN  t_cluster_table_tab,
         p_dry_run           IN  BOOLEAN,
         p_error_mode        IN  VARCHAR2,
+        p_sync_mode         IN  VARCHAR2,
         p_success_count     IN OUT NUMBER,
         p_conflict_count    IN OUT NUMBER,
         p_failed_count      IN OUT NUMBER,
@@ -2281,7 +2498,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 SAVEPOINT sp_table;
                 BEGIN
                     process_one_table(p_run_id, p_cluster_tables(i).table_name, p_cluster_id,
-                        p_cluster_tables(i).topo_order, p_dry_run, v_status);
+                        p_cluster_tables(i).topo_order, p_sync_mode, p_dry_run, v_status);
 
                     IF v_status = C_STATUS_SUCCESS THEN
                         p_success_count := p_success_count + 1;
@@ -2428,28 +2645,141 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     ----------------------------------------------------------------------
+    -- execute_clusters (privée)
+    --
+    -- Rôle : point commun d'exécution de la phase "grappes" d'un run, partagé
+    --        par SYNC_ALL et SYNC_TABLES (factorisation du corps historique de
+    --        SYNC_ALL) :
+    --          - calcul des grappes FK / tri topologique / exclusions de cycle ;
+    --          - mise à jour des compteurs de l'en-tête (TOTAL_TABLES /
+    --            TABLES_EXCLUDED) ;
+    --          - traitement des grappes par priorité moyenne croissante, avec
+    --            SET CONSTRAINTS ALL DEFERRED avant chaque grappe requérant un
+    --            cycle déferrable, COMMIT par grappe, SAVEPOINT par table ;
+    --          - statut final agrégé et clôture de l'en-tête.
+    --
+    -- p_active_tables  : tables DÉJÀ filtrées des blocages BLOCKING (par
+    --                    l'appelant, via SYNC_COMPATIBILITY_REPORT du CHECK_ID) ;
+    -- p_total_tables   : ensemble de référence (avant filtrage des blocages) ;
+    -- p_excluded_base  : nombre de tables déjà exclues AVANT les grappes
+    --                    (= p_total_tables - p_active_tables.COUNT).
+    --
+    -- Gère sa propre journalisation d'échec structurel (ROLLBACK + run FAILED
+    -- + RAISE) : un échec interne laisse l'exception se propager telle quelle.
+    ----------------------------------------------------------------------
+    PROCEDURE execute_clusters(
+        p_run_id            IN  NUMBER,
+        p_dry_run           IN  BOOLEAN,
+        p_error_mode        IN  VARCHAR2,
+        p_sync_mode         IN  VARCHAR2,
+        p_active_tables     IN  t_str_tab,
+        p_check_id          IN  NUMBER,
+        p_total_tables      IN  NUMBER,
+        p_excluded_base     IN  NUMBER
+    ) IS
+        v_cluster_tables    t_cluster_table_tab;
+        v_cluster_meta      t_cluster_meta_tab;
+        v_ordered_idx       t_num_tab;
+        v_excluded_count    NUMBER := p_excluded_base;
+        v_success_count     NUMBER := 0;
+        v_conflict_count    NUMBER := 0;
+        v_failed_count      NUMBER := 0;
+        v_stopped_early     BOOLEAN := FALSE;
+        v_final_status      VARCHAR2(30);
+    BEGIN
+        compute_run_clusters(p_active_tables, p_check_id, v_cluster_tables, v_cluster_meta);
+
+        FOR i IN 1 .. v_cluster_meta.COUNT LOOP
+            IF v_cluster_meta(i).excluded THEN
+                FOR j IN 1 .. v_cluster_tables.COUNT LOOP
+                    IF v_cluster_tables(j).cluster_id = v_cluster_meta(i).cluster_id THEN
+                        v_excluded_count := v_excluded_count + 1;
+                    END IF;
+                END LOOP;
+            END IF;
+        END LOOP;
+
+        UPDATE SYNC_RUN_HEADER
+        SET total_tables = p_total_tables, tables_excluded = v_excluded_count
+        WHERE run_id = p_run_id;
+        COMMIT;
+
+        v_ordered_idx := order_clusters_by_priority(v_cluster_meta);
+
+        FOR oi IN 1 .. v_ordered_idx.COUNT LOOP
+            EXIT WHEN v_stopped_early;
+
+            DECLARE
+                v_meta_idx  PLS_INTEGER := v_ordered_idx(oi);
+                v_cid       NUMBER := v_cluster_meta(v_meta_idx).cluster_id;
+            BEGIN
+                IF v_cluster_meta(v_meta_idx).requires_deferred THEN
+                    EXECUTE IMMEDIATE 'SET CONSTRAINTS ALL DEFERRED';
+                    -- Limite connue (signalée) : portée locale au schéma A
+                    -- uniquement, cf. commentaire détaillé en Partie 3.
+                END IF;
+
+                process_cluster(p_run_id, v_cid, v_cluster_tables, p_dry_run, p_error_mode, p_sync_mode,
+                    v_success_count, v_conflict_count, v_failed_count, v_stopped_early);
+
+                COMMIT; -- commit de la grappe entière (décision validée), qu'elle
+                        -- contienne ou non des tables en échec (celles-ci ont déjà
+                        -- été annulées individuellement par ROLLBACK TO SAVEPOINT
+                        -- dans process_cluster ; ce COMMIT ne valide donc que le
+                        -- travail des tables réussies de la grappe)
+            END;
+        END LOOP;
+
+        v_final_status := compute_final_status(
+            p_total_tables, v_success_count, v_conflict_count, v_failed_count, v_excluded_count
+        );
+        IF v_stopped_early AND v_final_status = C_STATUS_SUCCESS THEN
+            -- Cas limite : arrêt anticipé mais aucune table en échec comptée
+            -- (ne devrait pas arriver en pratique, v_stopped_early n'est mis à
+            -- TRUE que suite à un échec, mais gardé par prudence défensive).
+            v_final_status := C_STATUS_PARTIAL;
+        END IF;
+
+        UPDATE SYNC_RUN_HEADER SET
+            end_date = SYSTIMESTAMP,
+            status = v_final_status,
+            tables_success = v_success_count,
+            tables_conflict = v_conflict_count,
+            tables_failed = v_failed_count
+        WHERE run_id = p_run_id;
+        COMMIT;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Erreur structurelle survenue dans la phase grappes : le run est
+            -- marqué FAILED et l'exception est propagée à l'appelant, jamais
+            -- masquée (décision validée). ROLLBACK préalable (correctif v2) :
+            -- on ne doit pas valider par le COMMIT de l'en-tête un éventuel
+            -- travail de grappe déjà fait mais non commité.
+            ROLLBACK;
+            UPDATE SYNC_RUN_HEADER SET
+                end_date = SYSTIMESTAMP, status = C_STATUS_FAILED
+            WHERE run_id = p_run_id;
+            COMMIT;
+            RAISE;
+    END execute_clusters;
+
+
+    ----------------------------------------------------------------------
     -- SYNC_ALL  (procédure publique)
     ----------------------------------------------------------------------
     PROCEDURE SYNC_ALL (
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
         p_error_mode    IN  VARCHAR2 DEFAULT C_ERROR_MODE_CONTINUE,
         p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
-        p_run_id        OUT NUMBER
+        p_run_id        OUT NUMBER,
+        p_sync_mode     IN  VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT
     ) IS
         v_run_id            NUMBER := SYNC_RUN_ID_SEQ.NEXTVAL;
         v_check_id          NUMBER;
         v_blocking          BOOLEAN;
         v_active_tables     t_str_tab;
-        v_cluster_tables    t_cluster_table_tab;
-        v_cluster_meta      t_cluster_meta_tab;
-        v_ordered_idx       t_num_tab;
         v_total_tables      NUMBER := 0;
-        v_excluded_count    NUMBER := 0;
-        v_success_count     NUMBER := 0;
-        v_conflict_count    NUMBER := 0;
-        v_failed_count      NUMBER := 0;
-        v_stopped_early     BOOLEAN := FALSE;
-        v_final_status      VARCHAR2(30);
         v_config_count      NUMBER;
         v_discovered_count  NUMBER;
         -- Oracle SQL n'a pas de type BOOLEAN (contrairement à PL/SQL) : un
@@ -2466,6 +2796,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         -- apply_db_link_override AVANT que validate_common_params ne lève
         -- l'erreur, corrompant l'état de session pour tous les appels suivants.
         validate_common_params(p_error_mode, p_db_link);
+        validate_sync_mode(p_sync_mode);
         apply_db_link_override(p_db_link);
 
         INSERT INTO SYNC_RUN_HEADER (run_id, run_type, dry_run, error_mode)
@@ -2489,14 +2820,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         ------------------------------------------------------------------
         CHECK_COMPATIBILITY(p_table_name => NULL, p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
 
-        SELECT table_name BULK COLLECT INTO v_active_tables
-        FROM SYNC_TABLE_CONFIG stc
-        WHERE enabled = 'Y' AND sync_direction != C_DIRECTION_DISABLED
-          AND NOT EXISTS (
-              SELECT 1 FROM SYNC_COMPATIBILITY_REPORT r
-              WHERE r.check_id = v_check_id AND r.table_name = stc.table_name AND r.severity = C_SEVERITY_BLOCKING
-          );
-
         -- TOTAL_TABLES = ensemble de référence : nombre de tables ACTIVES
         -- avant filtrage des blocages (corrige le bug v1 où total valait le
         -- sous-ensemble déjà filtré, puis se faisait re-soustraire les mêmes
@@ -2505,86 +2828,27 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         FROM SYNC_TABLE_CONFIG
         WHERE enabled = 'Y' AND sync_direction != C_DIRECTION_DISABLED;
 
-        -- Exclues "structurelles" = tables configurées non retenues dans le
-        -- run (blocages de compatibilité). Les exclusions de grappes FK
-        -- (membres de cycle non déferrable) sont ajoutées juste après.
-        v_excluded_count := v_total_tables - v_active_tables.COUNT;
+        -- Tables actives non bloquantes = ensemble réellement traité. Le reste
+        -- est porté dans p_excluded_base de execute_clusters (comptabilisé en
+        -- TABLES_EXCLUDED, ainsi que les membres de grappes FK en cycle).
+        SELECT table_name BULK COLLECT INTO v_active_tables
+        FROM SYNC_TABLE_CONFIG stc
+        WHERE enabled = 'Y' AND sync_direction != C_DIRECTION_DISABLED
+          AND NOT EXISTS (
+              SELECT 1 FROM SYNC_COMPATIBILITY_REPORT r
+              WHERE r.check_id = v_check_id AND r.table_name = stc.table_name AND r.severity = C_SEVERITY_BLOCKING
+          );
 
         ------------------------------------------------------------------
-        -- 2) Grappes FK (référence CHECK_ID pour la journalisation des cycles)
+        -- 2) Exécution des grappes (factorisée avec SYNC_TABLES)
         ------------------------------------------------------------------
-        compute_run_clusters(v_active_tables, v_check_id, v_cluster_tables, v_cluster_meta);
-
-        FOR i IN 1 .. v_cluster_meta.COUNT LOOP
-            IF v_cluster_meta(i).excluded THEN
-                FOR j IN 1 .. v_cluster_tables.COUNT LOOP
-                    IF v_cluster_tables(j).cluster_id = v_cluster_meta(i).cluster_id THEN
-                        v_excluded_count := v_excluded_count + 1;
-                    END IF;
-                END LOOP;
-            END IF;
-        END LOOP;
-
-        UPDATE SYNC_RUN_HEADER
-        SET total_tables = v_total_tables, tables_excluded = v_excluded_count
-        WHERE run_id = v_run_id;
-        COMMIT;
-
-        ------------------------------------------------------------------
-        -- 3) Traitement des grappes, par ordre de PRIORITY moyenne croissante
-        ------------------------------------------------------------------
-        v_ordered_idx := order_clusters_by_priority(v_cluster_meta);
-
-        FOR oi IN 1 .. v_ordered_idx.COUNT LOOP
-            EXIT WHEN v_stopped_early;
-
-            DECLARE
-                v_meta_idx  PLS_INTEGER := v_ordered_idx(oi);
-                v_cid       NUMBER := v_cluster_meta(v_meta_idx).cluster_id;
-            BEGIN
-                IF v_cluster_meta(v_meta_idx).requires_deferred THEN
-                    EXECUTE IMMEDIATE 'SET CONSTRAINTS ALL DEFERRED';
-                    -- Limite connue (signalée) : portée locale au schéma A
-                    -- uniquement, cf. commentaire détaillé en Partie 3.
-                END IF;
-
-                process_cluster(v_run_id, v_cid, v_cluster_tables, p_dry_run, p_error_mode,
-                    v_success_count, v_conflict_count, v_failed_count, v_stopped_early);
-
-                COMMIT; -- commit de la grappe entière (décision validée), qu'elle
-                        -- contienne ou non des tables en échec (celles-ci ont déjà
-                        -- été annulées individuellement par ROLLBACK TO SAVEPOINT
-                        -- dans process_cluster ; ce COMMIT ne valide donc que le
-                        -- travail des tables réussies de la grappe)
-            END;
-        END LOOP;
-
-        ------------------------------------------------------------------
-        -- 4) Statut final
-        ------------------------------------------------------------------
-        v_final_status := compute_final_status(
-            v_total_tables, v_success_count, v_conflict_count, v_failed_count, v_excluded_count
-        );
-        IF v_stopped_early AND v_final_status = C_STATUS_SUCCESS THEN
-            -- Cas limite : arrêt anticipé mais aucune table en échec comptée
-            -- (ne devrait pas arriver en pratique, v_stopped_early n'est mis à
-            -- TRUE que suite à un échec, mais gardé par prudence défensive).
-            v_final_status := C_STATUS_PARTIAL;
-        END IF;
-
-        UPDATE SYNC_RUN_HEADER SET
-            end_date = SYSTIMESTAMP,
-            status = v_final_status,
-            tables_success = v_success_count,
-            tables_conflict = v_conflict_count,
-            tables_failed = v_failed_count
-        WHERE run_id = v_run_id;
-        COMMIT;
+        execute_clusters(v_run_id, p_dry_run, p_error_mode, p_sync_mode, v_active_tables, v_check_id,
+            v_total_tables, v_total_tables - v_active_tables.COUNT);
 
     EXCEPTION
         WHEN OTHERS THEN
-            -- Erreur structurelle survenue AVANT ou EN DEHORS de la boucle de
-            -- traitement des grappes (ex. schéma/DB LINK inaccessible dès
+            -- Erreur structurelle survenue AVANT ou EN DEHORS de la phase
+            -- grappes (ex. schéma/DB LINK inaccessible dès
             -- CHECK_COMPATIBILITY). Le run est marqué FAILED et l'exception
             -- est propagée à l'appelant, jamais masquée (décision validée).
             -- ROLLBACK préalable (correctif v2) : on ne doit PAS valider par
@@ -2612,7 +2876,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_table_name    IN  VARCHAR2,
         p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
         p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
-        p_run_id        OUT NUMBER
+        p_run_id        OUT NUMBER,
+        p_sync_mode     IN  VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT
     ) IS
         v_run_id        NUMBER := SYNC_RUN_ID_SEQ.NEXTVAL;
         v_check_id      NUMBER;
@@ -2629,6 +2894,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         -- correctif dans SYNC_ALL : évite de corrompre g_db_link_b sur un
         -- p_db_link invalide).
         validate_common_params(C_ERROR_MODE_STOP, p_db_link);
+        validate_sync_mode(p_sync_mode);
         apply_db_link_override(p_db_link);
 
         SELECT COUNT(*) INTO v_exists FROM SYNC_TABLE_CONFIG
@@ -2662,7 +2928,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
         SAVEPOINT sp_table;
         BEGIN
-            process_one_table(v_run_id, p_table_name, NULL, 1, p_dry_run, v_status);
+            process_one_table(v_run_id, p_table_name, NULL, 1, p_sync_mode, p_dry_run, v_status);
             v_final_status := v_status;
             COMMIT;
         EXCEPTION
@@ -2699,6 +2965,112 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             COMMIT;
             RAISE;
     END SYNC_TABLE;
+
+
+    ----------------------------------------------------------------------
+    -- SYNC_TABLES  (procédure publique)
+    --
+    -- Rôle : synchronise une LISTE de tables (type public t_tab_name_list)
+    --        avec RÉSOLUTION IMPLICITE DES DÉPENDANCES FK (parents). Cf.
+    --        spécification (Script 3) pour la doc fonctionnelle complète.
+    --
+    -- Séquence :
+    --   1. validation des paramètres (liste non vide, p_error_mode, p_db_link,
+    --      p_sync_mode), puis validation de chaque table demandée (existante et
+    --      ACTIVE : ENABLED='Y' et SYNC_DIRECTION != 'DISABLED'), sinon
+    --      E_TABLE_NOT_CONFIGURED ;
+    --   2. fermeture transitive des ANCÊTRES FK configurés et actifs
+    --      (expand_fk_ancestors) -> ensemble de run = demandées ∪ parents ;
+    --   3. en-tête (RUN_TYPE='SYNC_TABLES'), CHECK_COMPATIBILITY sur le
+    --      sous-ensemble (un seul CHECK_ID), filtration des tables BLOCKING ;
+    --   4. exécution par grappes (execute_clusters, identique à SYNC_ALL).
+    ----------------------------------------------------------------------
+    PROCEDURE SYNC_TABLES (
+        p_table_list    IN  t_tab_name_list,
+        p_dry_run       IN  BOOLEAN  DEFAULT FALSE,
+        p_error_mode    IN  VARCHAR2 DEFAULT C_ERROR_MODE_CONTINUE,
+        p_db_link       IN  VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
+        p_sync_mode     IN  VARCHAR2 DEFAULT C_SYNC_MODE_KEEP_CURRENT,
+        p_run_id        OUT NUMBER
+    ) IS
+        v_run_id        NUMBER := SYNC_RUN_ID_SEQ.NEXTVAL;
+        v_check_id      NUMBER;
+        v_blocking      BOOLEAN;
+        v_requested     t_str_tab;
+        v_run_set       t_str_tab;
+        v_active        t_str_tab;
+        v_exists        NUMBER;
+        v_block         NUMBER;
+        v_total         NUMBER;
+        -- Cf. commentaire équivalent dans SYNC_ALL : un BOOLEAN PL/SQL ne peut
+        -- pas être référencé dans une instruction SQL statique.
+        v_dry_run_flag  VARCHAR2(1) := CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END;
+    BEGIN
+        IF p_table_list IS NULL OR p_table_list.COUNT = 0 THEN
+            RAISE_APPLICATION_ERROR(-20011,
+                'Parametre p_table_list vide : au moins une table logique attendue.');
+        END IF;
+
+        validate_common_params(p_error_mode, p_db_link);
+        validate_sync_mode(p_sync_mode);
+        apply_db_link_override(p_db_link);
+
+        -- 1) Validation : chaque table de la liste doit être active en config.
+        FOR i IN 1 .. p_table_list.COUNT LOOP
+            v_requested(i) := UPPER(TRIM(p_table_list(i)));
+
+            SELECT COUNT(*) INTO v_exists FROM SYNC_TABLE_CONFIG
+            WHERE table_name = v_requested(i)
+              AND enabled = 'Y'
+              AND sync_direction != C_DIRECTION_DISABLED;
+
+            IF v_exists = 0 THEN
+                RAISE_APPLICATION_ERROR(-20002,
+                    'Table non configuree ou desactivee pour la synchronisation : ' || v_requested(i));
+            END IF;
+        END LOOP;
+
+        -- 2) Résolution implicite des parents FK (ancêtres configurés et actifs).
+        v_run_set := expand_fk_ancestors(v_requested);
+
+        INSERT INTO SYNC_RUN_HEADER (run_id, run_type, dry_run, error_mode)
+        VALUES (v_run_id, 'SYNC_TABLES', v_dry_run_flag, p_error_mode);
+        COMMIT; -- l'en-tête doit rester traçable même si tout échoue ensuite
+
+        p_run_id := v_run_id;
+
+        -- 3) Compatibilité sur le sous-ensemble (un seul CHECK_ID), puis
+        --    filtration des tables BLOCKING. TOTAL_TABLES = ensemble de run
+        --    (demandées + parents), cohérent avec ce qui est réellement exécuté.
+        v_total := v_run_set.COUNT;
+
+        compat_check_core(v_run_set, v_check_id, v_blocking);
+
+        FOR i IN 1 .. v_run_set.COUNT LOOP
+            SELECT COUNT(*) INTO v_block
+            FROM SYNC_COMPATIBILITY_REPORT
+            WHERE check_id = v_check_id AND table_name = v_run_set(i) AND severity = C_SEVERITY_BLOCKING;
+
+            IF v_block = 0 THEN
+                v_active(v_active.COUNT + 1) := v_run_set(i);
+            END IF;
+        END LOOP;
+
+        -- 4) Exécution des grappes (factorisée avec SYNC_ALL).
+        execute_clusters(v_run_id, p_dry_run, p_error_mode, p_sync_mode, v_active, v_check_id,
+            v_total, v_total - v_active.COUNT);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Erreur structurelle survenue AVANT ou EN DEHORS de la phase
+            -- grappes : run marqué FAILED, exception propagée (jamais masquée).
+            ROLLBACK;
+            UPDATE SYNC_RUN_HEADER SET
+                end_date = SYSTIMESTAMP, status = C_STATUS_FAILED
+            WHERE run_id = v_run_id;
+            COMMIT;
+            RAISE;
+    END SYNC_TABLES;
 
 
     ----------------------------------------------------------------------
