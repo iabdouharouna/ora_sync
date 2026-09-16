@@ -6,7 +6,7 @@
 
 Architecture générique, bidirectionnelle, idempotente, configurable, auditable et performante de synchronisation de données Oracle entre deux schémas via DB LINK.
 
-**Version 1.0 — Document de spécifications**
+**Version 2.0 — Document de spécifications** (correctifs et durcissements v2, cf. [§7](#7-changelog-v2))
 
 ---
 
@@ -18,6 +18,7 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 4. [Architecture technique](#4-architecture-technique)
 5. [Limites connues et risques assumés](#5-limites-connues-et-risques-assumés)
 6. [Annexes](#6-annexes)
+7. [Changelog v2](#7-changelog-v2)
 
 ---
 
@@ -127,8 +128,10 @@ Le paramètre `SYNC_DELETE` est conservé dans le modèle de données (verrouill
 
 Avant toute synchronisation, le package compare les métadonnées des tables entre `SCHEMA_A` et `SCHEMA_B` (colonnes, types, tailles, précision, échelle, nullabilité, clés) et produit un rapport d'anomalies avec deux niveaux de sévérité :
 
-- **BLOCKING** : la table est automatiquement exclue du run tant que l'anomalie n'est pas corrigée (ex. table absente d'un côté, type incompatible sur une colonne synchronisée, absence de clé exploitable).
-- **WARNING** : la table reste synchronisable, l'anomalie est seulement signalée (ex. colonne surnuméraire exclue de fait, nullabilité différente).
+- **BLOCKING** : la table est automatiquement exclue du run tant que l'anomalie n'est pas corrigée (ex. table absente d'un côté, type ou longueur incompatible sur une colonne synchronisée, absence de clé exploitable, clé configurée non unique en pratique, clés A/B divergentes).
+- **WARNING** : la table reste synchronisable, l'anomalie est seulement signalée (ex. colonne surnuméraire exclue de fait, nullabilité différente, absence de clé déclarée côté B alors que A en a une).
+
+Typologie des anomalies journalisées (`SYNC_COMPATIBILITY_REPORT.ISSUE_TYPE`) : `MISSING_IN_A`, `MISSING_IN_B`, `TYPE_MISMATCH`, `LENGTH_MISMATCH`, `NULLABLE_MISMATCH`, `PK_MISSING`, `PK_MISMATCH`, `UNSUPPORTED_TYPE`, `KEY_NOT_UNIQUE`, `FK_CYCLE_DEFERRABLE`, `FK_CYCLE_NOT_DEFERRABLE`. Les deux derniers portent sur les cycles FK (cf. [§4.5](#45-ordonnancement-des-écritures-dépendances-fk)) ; `PK_MISMATCH` (correctif v2) compare les clés de correspondance réellement retenues des deux côtés (`WARNING` si B n'a aucune clé détectable, `BLOCKING` si les clés diffèrent).
 
 ### 3.6. Mode simulation (DRY_RUN)
 
@@ -187,15 +190,18 @@ Les GTT sont déclarées `ON COMMIT PRESERVE ROWS` (et non `DELETE ROWS`), car l
 PKG_SCHEMA_SYNC.SYNC_ALL(
     p_dry_run     IN BOOLEAN  DEFAULT FALSE,
     p_error_mode  IN VARCHAR2 DEFAULT 'CONTINUE',
+    p_db_link     IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
     p_run_id      OUT NUMBER);
 
 PKG_SCHEMA_SYNC.SYNC_TABLE(
     p_table_name  IN VARCHAR2,
     p_dry_run     IN BOOLEAN DEFAULT FALSE,
+    p_db_link     IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
     p_run_id      OUT NUMBER);
 
 PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(
     p_table_name           IN VARCHAR2 DEFAULT NULL,
+    p_db_link              IN VARCHAR2 DEFAULT C_DB_LINK_KEEP_CURRENT,
     p_check_id             OUT NUMBER,
     p_has_blocking_issues  OUT BOOLEAN);
 
@@ -203,9 +209,17 @@ PKG_SCHEMA_SYNC.GET_RUN_STATUS(
     p_run_id         IN NUMBER,
     p_header_cursor  OUT SYS_REFCURSOR,
     p_detail_cursor  OUT SYS_REFCURSOR);
+
+PKG_SCHEMA_SYNC.SET_DB_LINK(p_db_link IN VARCHAR2);
+PKG_SCHEMA_SYNC.GET_DB_LINK RETURN VARCHAR2;
+PKG_SCHEMA_SYNC.PURGE_HISTORY(p_keep_days IN NUMBER);
 ```
 
 Les schémas A et B ne sont pas des paramètres d'appel : ils sont fixés par des constantes de package (`C_SCHEMA_A`, `C_SCHEMA_B`, `C_DB_LINK_B`), pour éviter qu'un appelant ne redirige accidentellement la synchronisation.
+
+La cible distante (`p_db_link`, ajouté en v2) peut être surchargée à l'exécution, sans recompilation : soit ponctuellement via `p_db_link` sur `SYNC_ALL`/`SYNC_TABLE`/`CHECK_COMPATIBILITY`, soit pour toute la session via `SET_DB_LINK` (`GET_DB_LINK` restitue la valeur active ; `NULL` = mode « même instance », sans DB LINK). La sentinelle `C_DB_LINK_KEEP_CURRENT` (valeur par défaut) signifie « ne rien changer à la valeur courante ». Un paramètre invalide (`p_error_mode` hors périmètre, `p_db_link` malformé, `p_keep_days <= 0`) est rejeté en entrée (`E_INVALID_PARAMETER`, ou `-20010` pour un identifiant SQL non conforme), **avant** tout effet de bord.
+
+`PURGE_HISTORY(p_keep_days)` (implémenté en v2) purge les tables d'audit à croissance illimitée : `SYNC_CONFLICT` (base `RESOLVED_DATE`), `SYNC_COMPATIBILITY_REPORT` (base `CHECK_DATE`), puis `SYNC_LOG`/`SYNC_RUN_HEADER` (base `START_DATE`, l'en-tête n'étant supprimé que si plus aucun log ne s'y rattache). `p_keep_days <= 0` est refusé : une purge totale doit rester une décision explicite hors du mode de maintenance.
 
 > **Point d'attention** — `SYNC_TABLE` ne traite que la table demandée, jamais le reste de sa grappe de dépendances FK. Si la table appartient à une grappe de plusieurs tables, cela peut introduire une incohérence référentielle transitoire. À réserver aux rattrapages ciblés ; préférer `SYNC_ALL` pour un traitement cohérent de grappe complète.
 
@@ -239,12 +253,23 @@ Le graphe des contraintes FK est découvert uniquement côté `SCHEMA_A` (hypoth
 
 Pour éviter une jointure distribuée coûteuse à travers le DB LINK, chaque ligne est réduite à un couple (clé, hash SHA-256) calculé indépendamment de chaque côté et rapatrié dans les tables de travail locales. Seules les clés dont le hash diffère déclenchent un rapatriement des colonnes complètes.
 
-- `DATE` / `TIMESTAMP [WITH [LOCAL] TIME ZONE]` : masque de format explicite et fixe (indépendant des paramètres NLS de session), pour éviter des faux conflits liés à une divergence de configuration NLS entre les deux instances.
-- `NUMBER` : conversion textuelle avec paramètres NLS numériques forcés.
-- `CLOB` / `BLOB` : hashés séparément via `DBMS_CRYPTO.HASH` (SHA-256), le résultat fixe intégré à la concaténation globale plutôt que le contenu brut du LOB.
-- `VARCHAR2` / `CHAR` / `RAW` / `INTERVAL` : conversion directe, non affectée par les paramètres NLS numériques.
+Normalisation des valeurs (indépendante des paramètres NLS de session, pour éviter des faux conflits liés à une divergence de configuration NLS entre les deux instances) :
 
-> **Coût de performance assumé** — Le hash SHA-256 est recalculé pour l'intégralité des lignes, y compris les colonnes LOB volumineuses, à chaque exécution — et pas seulement pour les lignes suspectes. Sur des tables à fort volume de LOB, ce peut devenir le poste de coût dominant du run.
+- `DATE` / `TIMESTAMP [WITH [LOCAL] TIME ZONE]` : `TO_CHAR` avec masque de format explicite et fixe.
+- `NUMBER` / `FLOAT` : `TO_CHAR` avec `TM9` et `NLS_NUMERIC_CHARACTERS` forcés.
+- `RAW` : `RAWTOHEX` ; `VARCHAR2` / `CHAR` / `INTERVAL` : conversion directe.
+- Valeur `NULL` : normalisée en sentinelle déterministe `<NULL>` (`NVL`), pour qu'une concaténation ne devienne jamais globalement `NULL` (ce qui ferait conclure à tort à l'égalité).
+
+**Double voie de hachage (correctif v2).** La fonction de hachage retenue dépend de la nature de la concaténation :
+
+- **Concaténation courte sans LOB** (borne pessimiste `< 4000` octets) : `RAWTOHEX(STANDARD_HASH(...,'SHA256'))`, chemin rapide et ensembliste, exécuté dans une unique instruction SQL.
+- **Concaténation longue ou présence de LOB** : `RAWTOHEX(DBMS_CRYPTO.HASH(..., 4))` sur une concaténation `CLOB`. Limite Oracle vérifiée empiriquement : ni `STANDARD_HASH` ni `DBMS_CRYPTO.HASH` ne peuvent consommer le **locator LOB d'une colonne de table** directement en SQL (`ORA-00902` / `ORA-00932`) ; un CLOB *construit en SQL* (concaténation de scalaires) est en revanche hashable. En conséquence :
+  - pour une table **sans colonne LOB**, tout est calculé en une passe SQL ensembliste (concaténation CLOB si nécessaire) ;
+  - pour une table **avec colonne LOB**, le hash est calculé **ligne par ligne en PL/SQL** (curseur dynamique `DBMS_SQL`), seul contexte où le locator LOB est exploitable ; `CLOB`/`NCLOB` entrent dans la concaténation `CLOB`, `BLOB` sont réduits à `RAWTOHEX(DBMS_CRYPTO.HASH(...))` avant intégration.
+
+> **Prérequis d'installation v2** — Le hachage LOB appelle `DBMS_CRYPTO.HASH` sous le compte `SYNC_ADMIN` : exécuter une fois, avec un compte privilégié, `GRANT EXECUTE ON DBMS_CRYPTO TO SYNC_ADMIN;`. Sans ce grant, toute table contenant un LOB échoue au run (`ORA-00904: "DBMS_CRYPTO"."HASH": invalid identifier`).
+
+> **Coût de performance assumé** — Le hash SHA-256 est recalculé pour l'intégralité des lignes, y compris les colonnes LOB volumineuses, à chaque exécution — et pas seulement pour les lignes suspectes. Sur des tables à fort volume de LOB, ce peut devenir le poste de coût dominant du run ; c'est de surcroît la seule voie où le traitement est ligne par ligne (et non ensembliste), limite intrinsèque à l'usage de `DBMS_CRYPTO` sur un LOB.
 
 ### 4.7. Application des écritures
 
@@ -270,14 +295,15 @@ Règle de conception distinctive : **aucune instruction MERGE n'est utilisée lo
 | Statut | Signification |
 |--------|---------------|
 | `SUCCESS` | Toutes les tables traitées, aucun conflit, aucun échec |
-| `SUCCESS_WITH_CONFLICTS` | Toutes les tables traitées, au moins un conflit journalisé (résolu ou en attente) |
-| `PARTIAL` | Au moins une table en échec (que le run ait été interrompu par `STOP_ON_ERROR` ou qu'il soit allé au bout en `CONTINUE`) |
+| `SUCCESS_WITH_CONFLICTS` | Toutes les tables traitées, au moins un conflit réel journalisé (résolu ou en attente). Les écarts forcés des tables en sens unique (`RESOLUTION_STRATEGY = 'DIRECTION_FORCED'`) ne comptent pas comme conflits. |
+| `PARTIAL` | Au moins une table en échec (que le run ait été interrompu par `STOP_ON_ERROR` ou qu'il soit allé au bout en `CONTINUE`). Le décompte `TOTAL_TABLES` couvre toutes les tables actives configurées ; `TABLES_EXCLUDED` isole celles écartées (incompatibilité structurelle ou grappe FK en cycle non déferrable). |
 | `FAILED` | Toutes les tables traitées ont échoué, ou erreur structurelle avant tout traitement |
 
 ### 4.10. Sécurité
 
 - Package en `AUTHID DEFINER`, exécuté par le compte technique `SYNC_ADMIN`.
 - Grants directs (SELECT, INSERT, UPDATE) sur les deux schémas — pas de DELETE, aucune suppression n'étant jamais nécessaire en v1.
+- Prérequis v2 : `GRANT EXECUTE ON DBMS_CRYPTO TO SYNC_ADMIN;` (hachage des colonnes LOB, cf. [§4.6](#46-détection-des-différences-hash-de-ligne)).
 - Tout identifiant (schéma, table, colonne) injecté dans du SQL dynamique passe systématiquement par `DBMS_ASSERT.SIMPLE_SQL_NAME`, y compris ceux lus depuis les tables de configuration.
 - Jamais de concaténation directe d'un paramètre non validé dans une instruction SQL dynamique.
 
@@ -291,15 +317,15 @@ Cette section consolide, en un seul endroit, l'ensemble des limites et risques s
 |---|-----------------|--------|
 | 1 | Le graphe de dépendances FK n'est découvert que côté `SCHEMA_A` ; une topologie FK différente côté `SCHEMA_B` n'est pas détectée ni réconciliée. | Assumé |
 | 2 | `SET CONSTRAINTS ALL DEFERRED` (cycles FK déferrables) ne couvre que le schéma local `SCHEMA_A` ; un cycle déferrable côté `SCHEMA_B` distant n'est pas couvert par cette instruction. | Assumé, à valider en environnement réel |
-| 3 | Le hash SHA-256 est calculé sur l'intégralité des lignes à chaque run, y compris les LOB volumineux, sans mécanisme d'exclusion configurable par table. | Assumé |
+| 3 | Le hash SHA-256 est calculé sur l'intégralité des lignes à chaque run, y compris les LOB volumineux, sans mécanisme d'exclusion configurable par table. De plus, les tables contenant un LOB sont hachées ligne par ligne (limite `DBMS_CRYPTO` sur les locators LOB en SQL). | Assumé |
 | 4 | La clause `UPDATE` distribuée avec sous-requête corrélée vers `SCHEMA_B` peut s'exécuter ligne par ligne selon le plan d'exécution retenu par l'optimiseur. | À valider en test de charge |
 | 5 | Le risque de transaction distribuée in-doubt (2PC) via DB LINK est accepté sans automatisation de la résolution (nécessite une supervision manuelle `DBA_2PC_PENDING`). | Accepté, supervision manuelle requise |
 | 6 | Toute suppression métier d'un côté est annulée (ligne réinsérée) par la synchronisation suivante, indéfiniment. | Assumé, comportement voulu |
 | 7 | La granularité SAVEPOINT par table au sein d'une grappe est un choix pris par l'architecte, non explicitement validé par le commanditaire. | À confirmer |
 | 8 | Le choix d'éviter tout MERGE vers une cible distante (INSERT+UPDATE à la place) est un choix pris par l'architecte pour des raisons de portabilité, non explicitement validé par le commanditaire. | À confirmer |
-| 9 | Le code n'a pas été compilé ni exécuté contre une instance Oracle réelle au moment de sa livraison ; une phase de compilation et de correction des éventuelles erreurs de syntaxe est indispensable avant toute utilisation. | Obligatoire avant mise en service |
+| 9 | Le code n'a pas été compilé ni exécuté contre une instance Oracle réelle au moment de sa livraison ; une phase de compilation et de correction des éventuelles erreurs de syntaxe est indispensable avant toute utilisation. | Levée en v2 (cf. note ci-dessous) |
 
-> **Note de mise à jour** — La limite n° 9 a été levée : le code a depuis été intégré dans `04_sync_package_body.sql`, compilé sur une instance Oracle réelle (`SYNC_ADMIN@freepdb1`, Oracle 23.26) et validé fonctionnellement (dry-run et run réel). Le package est actuellement `VALID`, 0 erreur.
+> **Note de mise à jour** — La limite n° 9 a été levée : le code a depuis été intégré dans `04_sync_package_body.sql`, compilé sur une instance Oracle réelle (`SYNC_ADMIN@freepdb1`, Oracle 23.26) et validé fonctionnellement (dry-run et run réel). Le package est actuellement `VALID`, 0 erreur. La v2 est couverte par le harnais automatisé `07_test_harness.sql` (toutes sections PASS) et par le jeu de scénarios `06_test_scenarios.sql`.
 
 ---
 
@@ -324,5 +350,21 @@ Ce document de spécifications accompagne les livrables techniques suivants, pro
 - **Script 2** — Tables de journalisation, conflits, compatibilité et tables de travail
 - **Script 3** — Spécification du package (`CREATE PACKAGE`)
 - **Script 4** — Corps du package (`CREATE PACKAGE BODY`)
-- **Script 5** — Tables métier d'exemple et données de configuration
-- **Script 6** — Jeu de tests fonctionnels (14 scénarios)
+- **Script 5** — Tables métier d'exemple, données et configuration (+ prérequis `GRANT EXECUTE ON DBMS_CRYPTO`)
+- **Script 6** — Jeu de tests fonctionnels guidés (16 scénarios)
+- **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL, non destructif)
+- **Script 8** — Migration v1 → v2 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT)
+
+---
+
+## 7. Changelog v2
+
+Récapitulatif des correctifs et durcissements apportés en v2 par rapport au document/à la livraison v1 :
+
+- **Hachage** : décision explicite `STANDARD_HASH` (chemin rapide, sans LOB et concaténation `< 4000`) vs `DBMS_CRYPTO.HASH` sur CLOB construit ; normalisation `NULL` par sentinelle ; les colonnes LOB participent désormais réellement au hash de ligne (en v1 elles étaient exclues, ce qui masquait les changements portant uniquement sur un LOB) ; tables avec LOB traitées ligne par ligne en PL/SQL (`DBMS_SQL`) faute de pouvoir hasher un locator LOB en SQL.
+- **Compatibilité** : réécriture de `CHECK_COMPATIBILITY` avec résolution explicite de la clé de chaque côté, nouveau contrôle `PK_MISMATCH` (`WARNING` si B sans clé, `BLOCKING` si clés divergentes) et contrôle `KEY_NOT_UNIQUE` `BLOCKING` sur les clés configurées, des deux côtés.
+- **Clé de correspondance** : résolution `PRIMARY KEY` puis `UNIQUE` puis `SYNC_KEY_CONFIG`, factorisée pour un accès local ou distant (DB LINK).
+- **Performance** : suppression du N+1 dans la journalisation des conflits (une requête ensembliste par table), décision de résolution calculée une fois par table (UPDATE ensembliste de `SYNC_WORK_DIFF`), `get_column_comparison` en colonnes explicites.
+- **Cycle de vie / robustesse** : `PURGE_HISTORY` implémenté (rétention configurable) ; `compute_run_clusters` aligné sur les constantes d'`ISSUE_TYPE` ; compteurs de `SYNC_ALL` corrigés (tables actives vs exclues) ; `ROLLBACK` de l'en-tête en cas d'échec global ; validation des paramètres d'entrée (`p_error_mode`, `p_db_link`, `p_keep_days`) **avant** tout effet de bord (corrige la corruption de `g_db_link_b` de session par un `p_db_link` invalide).
+- **Surcharge du DB LINK sans recompilation** : `SET_DB_LINK` / `GET_DB_LINK` et paramètre `p_db_link` sur l'API.
+- **Tests / documentation** : Script 6 enrichi et scindé pour les étapes DDL manuelles, test de découverte non destructif (snapshot/restauration), nouveau harnais Script 7, README resynchronisé.

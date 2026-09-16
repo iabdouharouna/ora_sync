@@ -109,6 +109,12 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     C_SEVERITY_BLOCKING         CONSTANT VARCHAR2(10) := 'BLOCKING';
     C_SEVERITY_WARNING          CONSTANT VARCHAR2(10) := 'WARNING';
 
+    -- Types d'anomalie liés aux cycles FK (SYNC_COMPATIBILITY_REPORT.ISSUE_TYPE)
+    -- FK_CYCLE_DEFERRABLE     : cycle accepté, contraintes différées (WARNING)
+    -- FK_CYCLE_NOT_DEFERRABLE : cycle non déferrable, grappe exclue (BLOCKING)
+    C_ISSUE_FK_CYCLE_DEFERRABLE     CONSTANT VARCHAR2(30) := 'FK_CYCLE_DEFERRABLE';
+    C_ISSUE_FK_CYCLE_NOT_DEFERRABLE CONSTANT VARCHAR2(30) := 'FK_CYCLE_NOT_DEFERRABLE';
+
 
     --------------------------------------------------------------------------
     -- EXCEPTIONS PUBLIQUES
@@ -149,6 +155,11 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- p_run_id inconnu passé à GET_RUN_STATUS.
     E_RUN_NOT_FOUND               EXCEPTION;
     PRAGMA EXCEPTION_INIT (E_RUN_NOT_FOUND, -20006);
+
+    -- Paramètre d'appel invalide (p_error_mode hors CONTINUE/STOP,
+    -- p_db_link non vide mais ne passant pas DBMS_ASSERT, p_keep_days <= 0...).
+    E_INVALID_PARAMETER           EXCEPTION;
+    PRAGMA EXCEPTION_INIT (E_INVALID_PARAMETER, -20011);
 
 
     --------------------------------------------------------------------------
@@ -302,6 +313,35 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
         p_run_id            IN  NUMBER,
         p_header_cursor      OUT SYS_REFCURSOR,   -- une ligne : SYNC_RUN_HEADER du run
         p_detail_cursor      OUT SYS_REFCURSOR    -- N lignes : SYNC_LOG par table du run
+    );
+
+    ----------------------------------------------------------------------
+    -- PURGE_HISTORY
+    --
+    -- Rôle : purge de maintenance des tables d'audit dont la volumétrie
+    --        croît avec le nombre de runs : SYNC_CONFLICT,
+    --        SYNC_COMPATIBILITY_REPORT et SYNC_LOG+SYNC_RUN_HEADER.
+    --        Inspiré de la limite signalée dans le Script 2 ("purge/rétention
+    --        à prévoir en exploitation"), ici automatisée.
+    --
+    -- Paramètres :
+    --   p_keep_days : âge (jours) en-deçà duquel les enregistrements sont
+    --                 CONSERVÉS ; tout ce qui est strictement antérieur à
+    --                 (SYSTIMESTAMP - p_keep_days) est supprimé.
+    --                 p_keep_days <= 0 est rejeté (E_INVALID_PARAMETER) :
+    --                 une suppression totale doit être une décision explicite
+    --                 hors de ce mode de maintenance.
+    --
+    -- Base de purge : SYNC_CONFLICT  -> RESOLVED_DATE
+    --                 SYNC_COMPATIBILITY_REPORT -> CHECK_DATE
+    --                 SYNC_LOG       -> START_DATE (puis SYNC_RUN_HEADER dont
+    --                                   plus aucune ligne SYNC_LOG ne dépend)
+    --
+    -- Exemple : PURGE_HISTORY(90) supprime tout ce qui précède les 90
+    -- derniers jours.
+    ----------------------------------------------------------------------
+    PROCEDURE PURGE_HISTORY (
+        p_keep_days IN NUMBER
     );
 
 END PKG_SCHEMA_SYNC;

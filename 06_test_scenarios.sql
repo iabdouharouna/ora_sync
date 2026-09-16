@@ -253,31 +253,54 @@ END;
 
 --------------------------------------------------------------------------------
 -- TEST 10 — Structure incompatible
---------------------------------------------------------------------------------
+--
+-- Etape manuelle PREALABLE (a executer connecte en SCHEMA_B, jamais via
+-- le DB LINK : le DDL distant n'est pas supporte par Oracle) :
+--     ALTER TABLE CLIENT MODIFY EMAIL VARCHAR2(50);
+-- (retrecir EMAIL rend la structure B incompatible avec A)
+--
+-- Le script sonde la longueur reellement en vigueur des deux cotes puis
+-- n'emet un verdict qu'en consequence : si l'ecart est en place,
+-- CHECK_COMPATIBILITY doit remonter BLOCKING ; sinon il affiche un SKIP
+-- (etape manuelle non appliquee) et s'arrete la pour le test 10.
+------------------------------------------------------------------------
 BEGIN
     TEST_HEADER(10, 'Structure incompatible : EMAIL retreci cote B');
 END;
 /
-ALTER TABLE SCHEMA_B.CLIENT@SYNC_LINK_B MODIFY EMAIL VARCHAR2(50);
--- NOTE : ALTER TABLE via DB LINK n'est PAS supporte par Oracle (DDL distant
--- impossible via un simple DB LINK). Cette instruction doit en realite etre
--- executee via une CONNEXION DIRECTE a SCHEMA_B, pas via SYNC_LINK_B depuis
--- SYNC_ADMIN. Corrige ici a titre de mise en garde explicite : se connecter
--- reellement a SCHEMA_B pour ce test.
--- ALTER TABLE CLIENT MODIFY EMAIL VARCHAR2(50);  -- a executer connecte en SCHEMA_B
+SELECT 'Test 10 - Longueur EMAIL cote A' AS verif, DATA_LENGTH FROM ALL_TAB_COLUMNS
+WHERE OWNER = 'SCHEMA_A' AND TABLE_NAME = 'CLIENT' AND COLUMN_NAME = 'EMAIL'
+UNION ALL
+SELECT 'Test 10 - Longueur EMAIL cote B', DATA_LENGTH FROM ALL_TAB_COLUMNS@SYNC_LINK_B
+WHERE OWNER = 'SCHEMA_B' AND TABLE_NAME = 'CLIENT' AND COLUMN_NAME = 'EMAIL';
 
 DECLARE
-    v_check_id NUMBER;
-    v_blocking BOOLEAN;
+    v_len_a     NUMBER;
+    v_len_b     NUMBER;
+    v_check_id  NUMBER;
+    v_blocking  BOOLEAN;
 BEGIN
-    PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => 'CLIENT', p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
-    DBMS_OUTPUT.PUT_LINE('CLIENT incompatible -> blocking = ' || CASE WHEN v_blocking THEN 'TRUE (attendu)' ELSE 'FALSE' END);
+    SELECT DATA_LENGTH INTO v_len_a FROM ALL_TAB_COLUMNS
+     WHERE OWNER = 'SCHEMA_A' AND TABLE_NAME = 'CLIENT' AND COLUMN_NAME = 'EMAIL';
+    SELECT DATA_LENGTH INTO v_len_b FROM ALL_TAB_COLUMNS@SYNC_LINK_B
+     WHERE OWNER = 'SCHEMA_B' AND TABLE_NAME = 'CLIENT' AND COLUMN_NAME = 'EMAIL';
+
+    IF v_len_b < v_len_a THEN
+        PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => 'CLIENT', p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
+        IF v_blocking THEN
+            DBMS_OUTPUT.PUT_LINE('OK - ecart de longueur detecte, blocking = TRUE (attendu).');
+        ELSE
+            DBMS_OUTPUT.PUT_LINE('ANOMALIE - ecart de longueur present mais blocking = FALSE.');
+        END IF;
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('SKIP - etape manuelle non appliquee (B.EMAIL pas retreci).');
+    END IF;
 END;
 /
 SELECT * FROM SYNC_COMPATIBILITY_REPORT WHERE TABLE_NAME = 'CLIENT' AND ISSUE_TYPE = 'LENGTH_MISMATCH'
-ORDER BY CHECK_DATE DESC;
+ORDER BY CHECK_DATE DESC FETCH FIRST 1 ROW ONLY;
 
--- Restauration (connecte en SCHEMA_B) :
+-- Restauration (connecte en SCHEMA_B), si l'etape manuelle a ete appliquee :
 -- ALTER TABLE CLIENT MODIFY EMAIL VARCHAR2(200);
 
 
@@ -308,43 +331,93 @@ COMMIT;
 --------------------------------------------------------------------------------
 -- TEST 12 — Erreur sur une table (simulation) + TEST 13 — Reprise après erreur
 --
--- Simulation : on insere cote A une valeur de STATUT trop longue pour la
--- contrainte implicite de longueur de COMMANDE.STATUT cote B (apres l'avoir
--- artificiellement retrecie), pour provoquer une erreur ORA-12899 au moment
--- de l'INSERT distribue.
+-- Etape manuelle PREALABLE (connecte en SCHEMA_B, pas via DB LINK) :
+--     ALTER TABLE COMMANDE MODIFY STATUT VARCHAR2(5);
+-- (retrecci volontairement pour provoquer un ORA-12899 a l'INSERT distribue)
+--
+-- Le script insere cote A une commande dont le STATUT ('STATUT_TROP_LONG',
+-- 17 caracteres) depasse la largeur 5 retrecie, lance un SYNC_ALL en mode
+-- CONTINUE, puis sonde la largeur reellement en vigueur cote B pour choisir
+-- le verdict : si B.STATUT est retreci, COMMANDE doit etre en FAILED (erreur
+-- journalisee) ; sinon le test est en SKIP (etape manuelle non appliquee, la
+-- commande se synchronise normalement). Le Test 13 reprend ensuite avec une
+-- nouvelle tentative apres correction de la largeur.
 --------------------------------------------------------------------------------
 BEGIN
     TEST_HEADER(12, 'Erreur sur une table (simulation) + Test 13 (reprise)');
 END;
 /
--- Connecte en SCHEMA_B : ALTER TABLE COMMANDE MODIFY STATUT VARCHAR2(5);
--- (reduit volontairement la taille pour provoquer une erreur a l'insertion)
 
-INSERT INTO SCHEMA_A.COMMANDE (COMMANDE_ID, CLIENT_ID, STATUT) VALUES (1001, 1, 'STATUT_TROP_LONG');
+-- Insertion idempotente de la commande (le re-jeu du script ne doit pas
+-- echouer sur une contrainte PK).
+DECLARE
+    v_cnt NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_cnt FROM SCHEMA_A.COMMANDE WHERE COMMANDE_ID = 1001;
+    IF v_cnt = 0 THEN
+        INSERT INTO SCHEMA_A.COMMANDE (COMMANDE_ID, CLIENT_ID, STATUT) VALUES (1001, 1, 'STATUT_TROP_LONG');
+        DBMS_OUTPUT.PUT_LINE('Commande 1001 inseree cote A.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('Commande 1001 deja presente cote A (re-jeu).');
+    END IF;
+END;
+/
 COMMIT;
 
+SELECT 'Test 12 - Largeur STATUT cote A' AS verif, DATA_LENGTH FROM ALL_TAB_COLUMNS
+WHERE OWNER = 'SCHEMA_A' AND TABLE_NAME = 'COMMANDE' AND COLUMN_NAME = 'STATUT'
+UNION ALL
+SELECT 'Test 12 - Largeur STATUT cote B', DATA_LENGTH FROM ALL_TAB_COLUMNS@SYNC_LINK_B
+WHERE OWNER = 'SCHEMA_B' AND TABLE_NAME = 'COMMANDE' AND COLUMN_NAME = 'STATUT';
+
 DECLARE
-    v_run_id NUMBER;
+    v_run_id   NUMBER;
+    v_len_b    NUMBER;
 BEGIN
+    SELECT DATA_LENGTH INTO v_len_b FROM ALL_TAB_COLUMNS@SYNC_LINK_B
+     WHERE OWNER = 'SCHEMA_B' AND TABLE_NAME = 'COMMANDE' AND COLUMN_NAME = 'STATUT';
+
+    IF v_len_b < 17 THEN
+        DBMS_OUTPUT.PUT_LINE('B.STATUT retreci (' || v_len_b || ') : le run suivant doit echouer sur COMMANDE.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('B.STATUT non retreci (' || v_len_b || ') : Test 12 en SKIP, COMMANDE devrait se synchroniser.');
+    END IF;
+
     PKG_SCHEMA_SYNC.SYNC_ALL(p_dry_run => FALSE, p_error_mode => PKG_SCHEMA_SYNC.C_ERROR_MODE_CONTINUE, p_run_id => v_run_id);
     DBMS_OUTPUT.PUT_LINE('Run ID : ' || v_run_id);
 END;
 /
-SELECT 'Test 12 - Table COMMANDE en FAILED, erreur journalisee ?' AS verif, STATUS, ERROR_MESSAGE
+
+SELECT 'Test 12 + 13 - Derniere execution COMMANDE' AS verif, STATUS, ERROR_MESSAGE
 FROM SYNC_LOG WHERE TABLE_NAME = 'COMMANDE' ORDER BY START_DATE DESC FETCH FIRST 1 ROW ONLY;
 
--- Correction du probleme, puis nouvelle tentative (Test 13 : reprise)
--- Connecte en SCHEMA_B : ALTER TABLE COMMANDE MODIFY STATUT VARCHAR2(20);
-
+-- Phase de reprise (Test 13) : si l'etape manuelle de retrecissement a ete
+-- appliquee au Test 12, il faut d'abord RESTAURER la largeur cote B :
+--     ALTER TABLE COMMANDE MODIFY STATUT VARCHAR2(20);   -- connecte en SCHEMA_B
 DECLARE
-    v_run_id NUMBER;
+    v_len_b     NUMBER;
+    v_run_id    NUMBER;
+    v_final     NUMBER;
 BEGIN
-    PKG_SCHEMA_SYNC.SYNC_ALL(p_dry_run => FALSE, p_error_mode => PKG_SCHEMA_SYNC.C_ERROR_MODE_CONTINUE, p_run_id => v_run_id);
-    DBMS_OUTPUT.PUT_LINE('Run ID (reprise) : ' || v_run_id);
+    SELECT DATA_LENGTH INTO v_len_b FROM ALL_TAB_COLUMNS@SYNC_LINK_B
+     WHERE OWNER = 'SCHEMA_B' AND TABLE_NAME = 'COMMANDE' AND COLUMN_NAME = 'STATUT';
+
+    IF v_len_b >= 17 THEN
+        DBMS_OUTPUT.PUT_LINE('Reprise : largeur compatible (' || v_len_b || '), relance d''un SYNC_ALL.');
+        PKG_SCHEMA_SYNC.SYNC_ALL(p_dry_run => FALSE, p_error_mode => PKG_SCHEMA_SYNC.C_ERROR_MODE_CONTINUE, p_run_id => v_run_id);
+        DBMS_OUTPUT.PUT_LINE('Run ID (reprise) : ' || v_run_id);
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('SKIP reprise : restaurer la largeur cote B (ALTER ... STATUT VARCHAR2(20)) puis relancer.');
+    END IF;
+
+    SELECT COUNT(*) INTO v_final FROM SCHEMA_B.COMMANDE@SYNC_LINK_B WHERE COMMANDE_ID = 1001;
+    IF v_final > 0 THEN
+        DBMS_OUTPUT.PUT_LINE('OK - COMMANDE_ID=1001 present cote B apres reprise.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('ATTENTION - COMMANDE_ID=1001 toujours absent cote B (reprise non effectuee ?).');
+    END IF;
 END;
 /
-SELECT 'Test 13 - COMMANDE_ID=1001 present cote B apres correction ?' AS verif, COUNT(*) AS resultat
-FROM SCHEMA_B.COMMANDE@SYNC_LINK_B WHERE COMMANDE_ID = 1001;
 
 
 --------------------------------------------------------------------------------
@@ -374,16 +447,38 @@ WHERE RUN_ID = (SELECT MAX(RUN_ID) FROM SYNC_RUN_HEADER);
 --------------------------------------------------------------------------------
 -- TEST 15 — Decouverte automatique des tables (SYNC_TABLE_CONFIG vide)
 --
--- ATTENTION : ce test est DESTRUCTIF pour la configuration — il vide
--- SYNC_TABLE_CONFIG (et par cascade SYNC_COLUMN_CONFIG, SYNC_KEY_CONFIG)
--- pour observer la decouverte automatique, puis restaure une configuration
--- manuelle equivalente a celle du Script 5 en fin de test. A executer EN
--- DERNIER, jamais entre deux autres tests de ce script.
+-- NON DESTRUCTIF (correctif v2) : avant de vider la configuration, un
+-- instantane exact des trois tables de config (SYNC_TABLE_CONFIG,
+-- SYNC_COLUMN_CONFIG, SYNC_KEY_CONFIG) est pris dans des tables temporaires
+-- TMP_CFG_* ; la configuration est restauree a l'identique en fin de test
+-- (tout ajout fait avant le test, y compris LOG_EVENEMENT du Test 9, est
+-- preserve). A executer EN DERNIER de preference.
 --------------------------------------------------------------------------------
 BEGIN
     TEST_HEADER(15, 'Decouverte automatique quand SYNC_TABLE_CONFIG est vide');
 END;
 /
+
+-- Snapshot de la configuration (DROP tolérant : tables absentes au 1er passage)
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TMP_CFG_T';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TMP_CFG_C';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TMP_CFG_K';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+CREATE TABLE TMP_CFG_T AS SELECT * FROM SYNC_TABLE_CONFIG;
+CREATE TABLE TMP_CFG_C AS SELECT * FROM SYNC_COLUMN_CONFIG;
+CREATE TABLE TMP_CFG_K AS SELECT * FROM SYNC_KEY_CONFIG;
+COMMIT;
 
 DELETE FROM SYNC_TABLE_CONFIG;  -- cascade sur SYNC_COLUMN_CONFIG et SYNC_KEY_CONFIG
 COMMIT;
@@ -423,29 +518,20 @@ WHERE TABLE_NAME = 'LOG_EVENEMENT' AND SEVERITY = 'BLOCKING'
 ORDER BY CHECK_DATE DESC FETCH FIRST 1 ROW ONLY;
 
 --------------------------------------------------------------------------------
--- Restauration de la configuration manuelle (equivalente au Script 5), pour
--- ne pas laisser l'environnement dans un etat purement auto-decouvert si
--- l'exploitation doit se poursuivre apres ce jeu de tests.
+-- Restauration EXACTE de la configuration d'origine (snapshot du debut du test).
 --------------------------------------------------------------------------------
 DELETE FROM SYNC_TABLE_CONFIG;  -- purge la config auto-decouverte (cascade incluse)
 COMMIT;
 
-INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
-VALUES ('CLIENT', 'Y', 'BIDIRECTIONAL', 'SOURCE_A_WINS', 10);
-INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
-VALUES ('PRODUIT', 'Y', 'BIDIRECTIONAL', 'ERROR_ON_CONFLICT', 10);
-INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
-VALUES ('COMMANDE', 'Y', 'BIDIRECTIONAL', 'SOURCE_A_WINS', 20);
-INSERT INTO SYNC_TABLE_CONFIG (TABLE_NAME, ENABLED, SYNC_DIRECTION, CONFLICT_STRATEGY, PRIORITY)
-VALUES ('COMMANDE_LIGNE', 'Y', 'BIDIRECTIONAL', 'SOURCE_A_WINS', 20);
-INSERT INTO SYNC_COLUMN_CONFIG (TABLE_NAME, COLUMN_NAME, SYNC_ENABLED)
-VALUES ('CLIENT', 'DATE_CREATION', 'N');
+INSERT INTO SYNC_TABLE_CONFIG SELECT * FROM TMP_CFG_T;
+INSERT INTO SYNC_COLUMN_CONFIG SELECT * FROM TMP_CFG_C;
+INSERT INTO SYNC_KEY_CONFIG SELECT * FROM TMP_CFG_K;
 COMMIT;
 
--- NOTE : si le Test 9 (table sans PK, LOG_EVENEMENT) doit rester actif au-delà
--- de ce script, ré-exécuter aussi son insertion SYNC_TABLE_CONFIG et son
--- SYNC_KEY_CONFIG (CODE_EVT) — non repris ici automatiquement, la restauration
--- ci-dessus ne couvre que le socle du Script 5.
+DROP TABLE TMP_CFG_T PURGE;
+DROP TABLE TMP_CFG_C PURGE;
+DROP TABLE TMP_CFG_K PURGE;
+COMMIT;
 
 
 --------------------------------------------------------------------------------

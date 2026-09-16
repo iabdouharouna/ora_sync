@@ -27,6 +27,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     );
     TYPE t_column_tab IS TABLE OF t_column_rec INDEX BY PLS_INTEGER;
 
+    -- Index par nom de colonne : permet de retrouver le type/métadonnée d'une
+    -- colonne (dont les colonnes de clé, cf. hachage canonique NLS-dependent)
+    -- sans relire le dictionnaire.
+    TYPE t_coltype_tab IS TABLE OF t_column_rec INDEX BY VARCHAR2(128);
+
     -- Une ligne = une colonne comparée entre A et B (CHECK_COMPATIBILITY /
     -- découverte des colonnes synchronisées).
     TYPE t_col_compare_rec IS RECORD (
@@ -148,6 +153,273 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     --------------------------------------------------------------------------
+    -- sql_literal
+    --
+    -- Rôle : retourne la représentation SQL d'une constante littérale,
+    --        quotes simples échappées comprises. Permet d'injecter des
+    --        littéraux dans du SQL dynamique sans se battre avec l'échappement
+    --        des apostrophes à la main (typiquement les chaînes NLS et les
+    --        séparateurs '~~').
+    --------------------------------------------------------------------------
+    FUNCTION sql_literal(p_value IN VARCHAR2) RETURN VARCHAR2 IS
+        v_q CHAR(1) := '''';
+    BEGIN
+        RETURN v_q || REPLACE(p_value, v_q, v_q || v_q) || v_q;
+    END sql_literal;
+
+
+    --------------------------------------------------------------------------
+    -- get_col_type_map
+    --
+    -- Rôle : charge, pour une table locale (SCHEMA_A), une map colonne ->
+    --        métadonnée (type, taille, précision, nullable, is_lob). Utilisée
+    --        par le hachage canonique pour choisir le masque NLS par type.
+    --        Le hachage d'une table donnée est généré à l'identique des deux
+    --        côtés : les types A font référence, B est supposé structurellement
+    --        identique (garanti par CHECK_COMPATIBILITY avant tout run).
+    --------------------------------------------------------------------------
+    FUNCTION get_col_type_map(p_table_name IN VARCHAR2) RETURN t_coltype_tab IS
+        v_map t_coltype_tab;
+        v_tab VARCHAR2(128) := sanitize_ident(p_table_name);
+    BEGIN
+        FOR c IN (
+            SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
+            FROM ALL_TAB_COLUMNS
+            WHERE owner = C_SCHEMA_A AND table_name = v_tab
+        ) LOOP
+            v_map(c.column_name).column_name    := c.column_name;
+            v_map(c.column_name).data_type      := c.data_type;
+            v_map(c.column_name).data_length    := c.data_length;
+            v_map(c.column_name).data_precision := c.data_precision;
+            v_map(c.column_name).data_scale     := c.data_scale;
+            v_map(c.column_name).nullable       := c.nullable;
+            v_map(c.column_name).is_lob         := c.data_type IN ('CLOB', 'BLOB', 'NCLOB');
+        END LOOP;
+        RETURN v_map;
+    END get_col_type_map;
+
+
+    --------------------------------------------------------------------------
+    -- type_map_from_columns
+    --
+    -- Rôle : variante de get_col_type_map construite à partir d'une collection
+    --        t_column_tab déjà en main (ex. p_columns de get_sync_columns) :
+    --        évite une relecture du dictionnaire quand les métadonnées ont
+    --        déjà été chargées.
+    --------------------------------------------------------------------------
+    FUNCTION type_map_from_columns(p_columns IN t_column_tab) RETURN t_coltype_tab IS
+        v_map t_coltype_tab;
+    BEGIN
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            v_map(p_columns(i).column_name) := p_columns(i);
+        END LOOP;
+        RETURN v_map;
+    END type_map_from_columns;
+
+
+    --------------------------------------------------------------------------
+    -- canonical_scalar_expr
+    --
+    -- Rôle : normalize une colonne scalaire en une chaîne REPRODUCTIBLE entre
+    --        A et B, indépendante des paramètres NLS de session :
+    --          - DATE                -> masque 'YYYY-MM-DD HH24:MI:SS'
+    --          - TIMESTAMP*          -> masque avec fractions de seconde (et
+    --                                    fuseau pour WITH TIME ZONE)
+    --          - NUMBER/FLOAT        -> TM9 + NLS_NUMERIC_CHARACTERS forcé
+    --          - RAW                 -> RAWTOHEX
+    --          - VARCHAR2/CHAR/...   -> la colonne elle-même (non affectée par
+    --                                    les paramètres numériques NLS)
+    -- Tout autre type est rabattu sur TO_CHAR(colonne) en dernière chance.
+    -- Permet de corriger la divergence spec/code v1 (le README promettait ces
+    -- masques, le code utilisait un TO_CHAR nu, source de faux conflits).
+    --------------------------------------------------------------------------
+    FUNCTION canonical_scalar_expr(
+        p_col    IN t_column_rec,
+        p_prefix IN VARCHAR2
+    ) RETURN VARCHAR2 IS
+        v_col   VARCHAR2(140) := CASE WHEN p_prefix IS NOT NULL THEN p_prefix || '.' END
+                                 || sanitize_ident(p_col.column_name);
+        v_inner VARCHAR2(4000);
+        v_typ   VARCHAR2(128) := p_col.data_type;
+    BEGIN
+        IF v_typ = 'DATE' THEN
+            v_inner := 'TO_CHAR(' || v_col || ',' || sql_literal('YYYY-MM-DD HH24:MI:SS') || ')';
+        ELSIF v_typ LIKE 'TIMESTAMP%' THEN
+            IF v_typ LIKE '%TIME ZONE%' THEN
+                v_inner := 'TO_CHAR(' || v_col || ',' || sql_literal('YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM') || ')';
+            ELSE
+                v_inner := 'TO_CHAR(' || v_col || ',' || sql_literal('YYYY-MM-DD HH24:MI:SS.FF9') || ')';
+            END IF;
+        ELSIF v_typ IN ('NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE') THEN
+            v_inner := 'TO_CHAR(' || v_col || ',' || sql_literal('TM9') || ',' ||
+                       sql_literal('NLS_NUMERIC_CHARACTERS=''.,''') || ')';
+        ELSIF v_typ LIKE 'RAW%' THEN
+            v_inner := 'RAWTOHEX(' || v_col || ')';
+        ELSE
+            v_inner := v_col;
+        END IF;
+
+        -- NULL normalisé vers un sentinelle déterministe : une concaténation
+        -- de clé/ligne ne doit JAMAIS devenir NULL globalement (sinon le hash
+        -- serait NULL et la comparaison A/B conclurait à tort à l'égalité).
+        RETURN 'NVL(' || v_inner || ',' || sql_literal('<NULL>') || ')';
+    END canonical_scalar_expr;
+
+
+    --------------------------------------------------------------------------
+    -- lob_hash_expr
+    --
+    -- Rôle : retourne l'expression SQL produisant le hash SHA-256 d'une
+    --        colonne LOB, en hexadécimal. STANDARD_HASH refuse les types LOB
+    --        (documenté Oracle 23) : utilisation de DBMS_CRYPTO.HASH (valeur
+    --        constante HASH_SH256 = 4, littéral injecté). Le CLOB est hasher
+    --        par le moteur en une passe sans rapatriement applicatif.
+    -- Traitement par type (intégration dans la concaténation CLOB de ligne) :
+    --          - CLOB / NCLOB : colonne entrée directement dans la
+    --            concaténation (le hash final porte sur le CLOB global) ;
+    --          - BLOB         : ne peut pas entrer dans une concaténation
+    --            CLOB -> hashé isolément en hex, puis la chaîne est injectée.
+    -- Une valeur NULL produit le sentinelle '<NULL>' (le hash ne doit jamais
+    -- devenir NULL, sinon la comparaison conclurait à tort à l'égalité).
+    --------------------------------------------------------------------------
+    FUNCTION lob_hash_expr(
+        p_col    IN t_column_rec,
+        p_prefix IN VARCHAR2
+    ) RETURN VARCHAR2 IS
+        v_col VARCHAR2(140) := CASE WHEN p_prefix IS NOT NULL THEN p_prefix || '.' END
+                               || sanitize_ident(p_col.column_name);
+    BEGIN
+        IF p_col.data_type = 'BLOB' THEN
+            RETURN 'CASE WHEN ' || v_col || ' IS NULL THEN ' || sql_literal('<NULL>') ||
+                   ' ELSE TO_CLOB(RAWTOHEX(DBMS_CRYPTO.HASH(' || v_col || ',4))) END';
+        ELSE
+            RETURN 'CASE WHEN ' || v_col || ' IS NULL THEN ' || sql_literal('<NULL>') ||
+                   ' ELSE TO_CLOB(' || v_col || ') END';
+        END IF;
+    END lob_hash_expr;
+
+
+    --------------------------------------------------------------------------
+    -- build_key_concat_expr
+    --
+    -- Rôle : construit la concaténation canonique (séparateur '~~') des
+    --        colonnes de clé, NLS-safe par type. Base de la clé de
+    --        correspondance (PK_HASH_KEY).
+    -- p_as_clob=TRUE  : chaque morceau est enveloppé dans TO_CLOB, la
+    --        concaténation résultante est un CLOB (utilisé dans l'aller-retour
+    --        DBMS_CRYPTO quand la chaîne courte ne suffit plus). Dans le cas
+    --        contraire (FALSE), les morceaux restent VARCHAR2 pour le chemin
+    --        rapide STANDARD_HASH.
+    --------------------------------------------------------------------------
+    FUNCTION build_key_concat_expr(
+        p_key_cols IN t_str_tab,
+        p_types    IN t_coltype_tab,
+        p_prefix   IN VARCHAR2,
+        p_as_clob  IN BOOLEAN DEFAULT FALSE
+    ) RETURN VARCHAR2 IS
+        v_expr VARCHAR2(32000) := '';
+        v_piece VARCHAR2(32000);
+        v_col  t_column_rec;
+        v_found BOOLEAN;
+    BEGIN
+        FOR i IN 1 .. p_key_cols.COUNT LOOP
+            v_found := p_types.EXISTS(p_key_cols(i));
+            IF v_found THEN
+                v_col := p_types(p_key_cols(i));
+            ELSE
+                -- Défensif : une colonne de clé absente de la map retombe sur
+                -- TO_CHAR nu (ne devrait pas arriver : la clé est toujours
+                -- présente dans les colonnes synchronisées).
+                v_col.column_name := p_key_cols(i);
+                v_col.data_type   := 'VARCHAR2';
+            END IF;
+
+            v_piece := canonical_scalar_expr(v_col, p_prefix);
+            IF p_as_clob THEN
+                v_piece := 'TO_CLOB(' || v_piece || ')';
+            END IF;
+
+            v_expr := v_expr
+                || CASE WHEN i > 1 THEN ' ||' || sql_literal('~~') || ' || ' END
+                || v_piece;
+        END LOOP;
+        RETURN v_expr;
+    END build_key_concat_expr;
+
+
+    --------------------------------------------------------------------------
+    -- approx_text_len
+    --
+    -- Rôle : borne supérieure (pessimiste mais légère) de la longueur texte
+    --        produite par canonical_scalar_expr pour une colonne. Sert à
+    --        choisir le chemin de hachage : la concaténation courte
+    --        (VARCHAR2, limite 4000) est privilégiée quand c'est sûr, sinon
+    --        on bascule sur la concaténation CLOB + DBMS_CRYPTO. Tout LOB
+    --        renvoie volontairement 4000 pour forcer ce basculement.
+    --------------------------------------------------------------------------
+    FUNCTION approx_text_len(p_col IN t_column_rec) RETURN NUMBER IS
+    BEGIN
+        IF p_col.is_lob THEN
+            RETURN 4000;
+        ELSIF p_col.data_type IN ('NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE') THEN
+            RETURN NVL(p_col.data_precision, 38) + 3;
+        ELSIF p_col.data_type = 'DATE' THEN
+            RETURN 30;
+        ELSIF p_col.data_type LIKE 'TIMESTAMP%' THEN
+            RETURN 40;
+        ELSIF p_col.data_type LIKE 'RAW%' THEN
+            RETURN NVL(p_col.data_length, 32) * 2;
+        ELSE
+            RETURN NVL(p_col.data_length, 100);
+        END IF;
+    END approx_text_len;
+
+
+    --------------------------------------------------------------------------
+    -- build_key_hash_expr
+    --
+    -- Rôle : produit l'expression SQL finale de la clé de correspondance :
+    --        SHA-256 hexadécimal (64 caractères) de la concaténation canonique
+    --        des colonnes de clé, identique des deux côtés A/B.
+    -- Double chemin (décision v2) :
+    --          - concaténation courte (VARCHAR2 < 4000) : chemin rapide
+    --            RAWTOHEX(STANDARD_HASH(...,'SHA256')) ;
+    --          - sinon : concaténation CLOB + RAWTOHEX(DBMS_CRYPTO.HASH(c,4)),
+    --            qui supprime la limite VARCHAR2(4000) frappant la v1 sur les
+    --            clés composites longues (ORA-01489).
+    --------------------------------------------------------------------------
+    FUNCTION build_key_hash_expr(
+        p_key_cols IN t_str_tab,
+        p_types    IN t_coltype_tab,
+        p_prefix   IN VARCHAR2
+    ) RETURN VARCHAR2 IS
+        v_concat VARCHAR2(32000);
+        v_est    NUMBER := 0;
+        v_col    t_column_rec;
+        v_has    BOOLEAN;
+    BEGIN
+        FOR i IN 1 .. p_key_cols.COUNT LOOP
+            v_has := p_types.EXISTS(p_key_cols(i));
+            IF v_has THEN
+                v_col := p_types(p_key_cols(i));
+            ELSE
+                v_col.column_name := p_key_cols(i);
+                v_col.data_type   := 'VARCHAR2';
+            END IF;
+            v_est := v_est + approx_text_len(v_col) + 4;  -- + 4 = le séparateur '~~'
+        END LOOP;
+
+        IF v_est < 4000 THEN
+            v_concat := build_key_concat_expr(p_key_cols, p_types, p_prefix, FALSE);
+            RETURN 'RAWTOHEX(STANDARD_HASH(' || v_concat || ',' || sql_literal('SHA256') || '))';
+        END IF;
+
+        v_concat := build_key_concat_expr(p_key_cols, p_types, p_prefix, TRUE);
+        RETURN 'RAWTOHEX(DBMS_CRYPTO.HASH(' || v_concat || ',4))';
+    END build_key_hash_expr;
+
+
+    --------------------------------------------------------------------------
     -- SET_DB_LINK  (procédure publique)
     --
     -- Rôle : permet de fixer g_db_link_b à l'exécution, sans recompilation.
@@ -194,6 +466,35 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             SET_DB_LINK(p_db_link);
         END IF;
     END apply_db_link_override;
+
+
+    --------------------------------------------------------------------------
+    -- validate_common_params
+    --
+    -- Rôle : valide les paramètres communs d'entrée des procédures publiques
+    --        SYNC_ALL / SYNC_TABLE. Correctif v2 : en v1, un p_error_mode
+    --        inconnu n'était jamais rejeté — il retombait silencieusement dans
+    --        le comportement par défaut (comparaison à C_ERROR_MODE_STOP
+    --        toujours fausse), masquant une faute d'appel. De même, un
+    --        p_db_link malformé n'était détecté qu'au premier usage SQL,
+    --        souvent loin de l'appel fautif.
+    -- Lève -20011 (E_INVALID_PARAMETER) sur p_error_mode hors périmètre, et
+    --        laisse sanitize_ident rejeter (-20010) un p_db_link non
+    --        conforme.
+    --------------------------------------------------------------------------
+    PROCEDURE validate_common_params(p_error_mode IN VARCHAR2, p_db_link IN VARCHAR2) IS
+        v_check VARCHAR2(128);
+    BEGIN
+        IF p_error_mode NOT IN (C_ERROR_MODE_CONTINUE, C_ERROR_MODE_STOP) THEN
+            RAISE_APPLICATION_ERROR(-20011,
+                'Parametre p_error_mode invalide : [' || p_error_mode || '] (attendu : '
+                || C_ERROR_MODE_CONTINUE || ' ou ' || C_ERROR_MODE_STOP || ')');
+        END IF;
+
+        IF p_db_link IS NOT NULL AND p_db_link != C_DB_LINK_KEEP_CURRENT THEN
+            v_check := sanitize_ident(p_db_link);  -- lève -20010 si identifiant invalide
+        END IF;
+    END validate_common_params;
 
 
     --------------------------------------------------------------------------
@@ -265,53 +566,59 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     -- Retour  : collection vide si aucune PK ni UNIQUE trouvée (l'appelant
     --           doit alors basculer sur SYNC_KEY_CONFIG, cf. get_effective_key).
     --------------------------------------------------------------------------
-    FUNCTION get_primary_or_unique_key(p_table_name IN VARCHAR2) RETURN t_str_tab IS
+    -- Variante générique par propriétaire + DB LINK : permet de découvrir la
+    -- clé également côté B (indispensable pour émettre PK_MISMATCH dans
+    -- CHECK_COMPATIBILITY, cf. §3.5 du README, correctif v2).
+    FUNCTION get_primary_or_unique_key_for_owner(
+        p_owner      IN VARCHAR2,
+        p_table_name IN VARCHAR2,
+        p_db_link    IN VARCHAR2
+    ) RETURN t_str_tab IS
         v_result        t_str_tab;
         v_constraint    VARCHAR2(128);
+        v_link          VARCHAR2(128);
+        v_sql           VARCHAR2(4000);
     BEGIN
-        -- Recherche PRIMARY KEY
+        v_link := CASE WHEN p_db_link IS NOT NULL THEN '@' || sanitize_ident(p_db_link) END;
+
+        -- Recherche PRIMARY KEY (une seule possible par table en Oracle)
+        v_sql := 'SELECT constraint_name FROM ALL_CONSTRAINTS' || v_link
+                 || ' WHERE owner = :o AND table_name = :t AND constraint_type = ''P'''
+                 || '   AND status = ''ENABLED'' AND ROWNUM = 1';
         BEGIN
-            SELECT constraint_name INTO v_constraint
-            FROM ALL_CONSTRAINTS
-            WHERE owner = C_SCHEMA_A
-              AND table_name = p_table_name
-              AND constraint_type = 'P'
-              AND status = 'ENABLED';
+            EXECUTE IMMEDIATE v_sql INTO v_constraint USING p_owner, p_table_name;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN v_constraint := NULL;
-            WHEN TOO_MANY_ROWS THEN v_constraint := NULL; -- ne devrait jamais arriver (une seule PK possible)
         END;
 
         -- A défaut, première contrainte UNIQUE active, ordre déterministe
         IF v_constraint IS NULL THEN
+            v_sql := 'SELECT constraint_name FROM (' ||
+                     '  SELECT constraint_name FROM ALL_CONSTRAINTS' || v_link ||
+                     '  WHERE owner = :o AND table_name = :t AND constraint_type = ''U'''
+                     || '    AND status = ''ENABLED'' ORDER BY constraint_name)' ||
+                     ' WHERE ROWNUM = 1';
             BEGIN
-                SELECT constraint_name INTO v_constraint
-                FROM (
-                    SELECT constraint_name
-                    FROM ALL_CONSTRAINTS
-                    WHERE owner = C_SCHEMA_A
-                      AND table_name = p_table_name
-                      AND constraint_type = 'U'
-                      AND status = 'ENABLED'
-                    ORDER BY constraint_name
-                )
-                WHERE ROWNUM = 1;
+                EXECUTE IMMEDIATE v_sql INTO v_constraint USING p_owner, p_table_name;
             EXCEPTION
                 WHEN NO_DATA_FOUND THEN v_constraint := NULL;
             END;
         END IF;
 
         IF v_constraint IS NOT NULL THEN
-            SELECT column_name
-            BULK COLLECT INTO v_result
-            FROM ALL_CONS_COLUMNS
-            WHERE owner = C_SCHEMA_A
-              AND table_name = p_table_name
-              AND constraint_name = v_constraint
-            ORDER BY position;
+            v_sql := 'SELECT column_name FROM ALL_CONS_COLUMNS' || v_link
+                     || ' WHERE owner = :o AND table_name = :t AND constraint_name = :c'
+                     || ' ORDER BY position';
+            EXECUTE IMMEDIATE v_sql BULK COLLECT INTO v_result
+                USING p_owner, p_table_name, v_constraint;
         END IF;
 
         RETURN v_result;  -- collection vide (non NULL, .COUNT=0) si rien trouvé
+    END get_primary_or_unique_key_for_owner;
+
+    FUNCTION get_primary_or_unique_key(p_table_name IN VARCHAR2) RETURN t_str_tab IS
+    BEGIN
+        RETURN get_primary_or_unique_key_for_owner(C_SCHEMA_A, p_table_name, NULL);
     END get_primary_or_unique_key;
 
 
@@ -348,10 +655,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --           le moteur, inutile de la revérifier). Une clé configurée
     --           manuellement n'a AUCUNE garantie d'unicité tant qu'elle n'a
     --           pas été vérifiée en pratique sur les données réelles.
-    -- Méthode : COUNT(*) vs COUNT(DISTINCT clé concaténée) côté A ET côté B
-    --           (les deux doivent être vérifiés indépendamment : la clé peut
-    --           être unique côté A mais pas côté B, notamment si B contient
-    --           des données historiques divergentes).
+    -- Méthode : COUNT(*) vs COUNT(DISTINCT clé hashée canonique) côté A ET
+    --           côté B (les deux doivent être vérifiés indépendamment : la clé
+    --           peut être unique côté A mais pas côté B, notamment si B
+    --           contient des données historiques divergentes). Le hash (clé
+    --           canonique) rend le comptage robuste aux clés composites
+    --           longues (> 4000) et aux collisions de séparateur.
     -- Perf    : un COUNT(*) complet par table concernée, exécuté une seule
     --           fois par run (pas par ligne). Acceptable même sur plusieurs
     --           millions de lignes grâce à l'index sous-jacent si la clé
@@ -365,22 +674,20 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_owner         IN VARCHAR2,   -- C_SCHEMA_A ou C_SCHEMA_B
         p_db_link       IN VARCHAR2    -- NULL pour A (local), C_DB_LINK_B pour B
     ) RETURN BOOLEAN IS
-        v_key_expr      VARCHAR2(4000) := '';
-        v_sql           VARCHAR2(4000);
+        v_types         t_coltype_tab;
+        v_key_hash_expr VARCHAR2(32000);
+        v_sql           VARCHAR2(32000);
         v_total         NUMBER;
         v_distinct      NUMBER;
         v_table_ref     VARCHAR2(300);
     BEGIN
-        FOR i IN 1 .. p_key_cols.COUNT LOOP
-            v_key_expr := v_key_expr
-                || CASE WHEN i > 1 THEN '||''~~''||' END
-                || 'TO_CHAR(' || sanitize_ident(p_key_cols(i)) || ')';
-        END LOOP;
+        v_types := get_col_type_map(p_table_name);
+        v_key_hash_expr := build_key_hash_expr(p_key_cols, v_types, NULL);
 
         v_table_ref := sanitize_ident(p_owner) || '.' || sanitize_ident(p_table_name)
             || CASE WHEN p_db_link IS NOT NULL THEN '@' || sanitize_ident(p_db_link) END;
 
-        v_sql := 'SELECT COUNT(*), COUNT(DISTINCT ' || v_key_expr || ') FROM ' || v_table_ref;
+        v_sql := 'SELECT COUNT(*), COUNT(DISTINCT ' || v_key_hash_expr || ') FROM ' || v_table_ref;
 
         EXECUTE IMMEDIATE v_sql INTO v_total, v_distinct;
 
@@ -468,9 +775,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             'SELECT NVL(a.column_name, b.column_name), ' ||
             '       a.data_type, a.data_length, a.data_precision, a.data_scale, a.nullable, a.data_type_owner, ' ||
             '       b.data_type, b.data_length, b.data_precision, b.data_scale, b.nullable, b.data_type_owner ' ||
-            'FROM (SELECT * FROM ALL_TAB_COLUMNS WHERE owner = :owner_a AND table_name = :tbl) a ' ||
+            'FROM (SELECT column_name, data_type, data_length, data_precision, data_scale, nullable, data_type_owner ' ||
+            '      FROM ALL_TAB_COLUMNS WHERE owner = :owner_a AND table_name = :tbl) a ' ||
             'FULL OUTER JOIN ' ||
-            '     (SELECT * FROM ALL_TAB_COLUMNS' || b_link_suffix ||
+            '     (SELECT column_name, data_type, data_length, data_precision, data_scale, nullable, data_type_owner ' ||
+            '      FROM ALL_TAB_COLUMNS' || b_link_suffix ||
             '      WHERE owner = :owner_b AND table_name = :tbl2) b ' ||
             'ON a.column_name = b.column_name';
 
@@ -593,14 +902,23 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_check_id      NUMBER := SYNC_COMPAT_CHECK_ID_SEQ.NEXTVAL;
         v_blocking      BOOLEAN := FALSE;
         v_key           t_str_tab;
+        v_key_b         t_str_tab;
         v_compare       t_col_compare_tab;
         v_is_key        BOOLEAN;
+        v_from_config   BOOLEAN := FALSE;
+        v_keys_equal    BOOLEAN := TRUE;
+        v_detail_a      VARCHAR2(4000) := '';
+        v_detail_b      VARCHAR2(4000) := '';
 
         CURSOR c_tables IS
             SELECT table_name FROM SYNC_TABLE_CONFIG
             WHERE (p_table_name IS NULL OR table_name = p_table_name)
               AND enabled = 'Y';
     BEGIN
+        -- Correctif v2 : valider AVANT d'appliquer l'override (p_error_mode
+        -- passé en CONTINUE car CHECK_COMPATIBILITY n'a pas de mode d'erreur :
+        -- seule la validation de p_db_link nous intéresse ici).
+        validate_common_params(C_ERROR_MODE_CONTINUE, p_db_link);
         apply_db_link_override(p_db_link);
 
         FOR t IN c_tables LOOP
@@ -619,15 +937,77 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 CONTINUE;
             END IF;
 
-            BEGIN
-                v_key := get_effective_key(t.table_name);
-            EXCEPTION
-                WHEN OTHERS THEN
-                    insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISSING', C_SEVERITY_BLOCKING,
-                        SQLERRM, NULL);
+            ------------------------------------------------------------------
+            -- Résolution explicite de la clé efficace (A), distincte de la
+            -- découverte automatique (P puis U), puis SYNC_KEY_CONFIG.
+            -- Corrige le défaut v1 qui rabattait TOUT échec sur PK_MISSING :
+            -- une clé configurée non unique doit lever KEY_NOT_UNIQUE.
+            ------------------------------------------------------------------
+            v_key         := get_primary_or_unique_key(t.table_name);
+            v_from_config := (v_key.COUNT = 0);
+            IF v_from_config THEN
+                v_key := get_configured_key(t.table_name);
+            END IF;
+
+            IF v_key.COUNT = 0 THEN
+                insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISSING', C_SEVERITY_BLOCKING,
+                    'Aucune cle exploitable (ni PK/UNIQUE Oracle, ni SYNC_KEY_CONFIG)', NULL);
+                v_blocking := TRUE;
+                CONTINUE;
+            END IF;
+
+            IF v_from_config THEN
+                IF NOT validate_key_uniqueness(t.table_name, v_key, C_SCHEMA_A, NULL) THEN
+                    insert_compat_report(v_check_id, t.table_name, NULL, 'KEY_NOT_UNIQUE', C_SEVERITY_BLOCKING,
+                        'Cle configuree non unique en pratique cote SCHEMA_A', NULL);
                     v_blocking := TRUE;
                     CONTINUE;
-            END;
+                ELSIF NOT validate_key_uniqueness(t.table_name, v_key, C_SCHEMA_B, g_db_link_b) THEN
+                    insert_compat_report(v_check_id, t.table_name, NULL, 'KEY_NOT_UNIQUE', C_SEVERITY_BLOCKING,
+                        'Cle configuree non unique en pratique cote SCHEMA_B', NULL);
+                    v_blocking := TRUE;
+                    CONTINUE;
+                END IF;
+            END IF;
+
+            ------------------------------------------------------------------
+            -- Conformité de la clé entre A et B (PK_MISMATCH, absent de la v1)
+            ------------------------------------------------------------------
+            v_key_b := get_primary_or_unique_key_for_owner(C_SCHEMA_B, t.table_name, g_db_link_b);
+
+            v_keys_equal := TRUE;
+            IF v_key.COUNT != v_key_b.COUNT THEN
+                v_keys_equal := FALSE;
+            ELSE
+                FOR i IN 1 .. v_key.COUNT LOOP
+                    IF v_key(i) != v_key_b(i) THEN
+                        v_keys_equal := FALSE;
+                        EXIT;
+                    END IF;
+                END LOOP;
+            END IF;
+
+            IF NOT v_keys_equal THEN
+                v_detail_a := '';
+                FOR i IN 1 .. v_key.COUNT LOOP
+                    v_detail_a := v_detail_a || CASE WHEN i > 1 THEN ',' END || v_key(i);
+                END LOOP;
+                v_detail_b := '';
+                FOR i IN 1 .. v_key_b.COUNT LOOP
+                    v_detail_b := v_detail_b || CASE WHEN i > 1 THEN ',' END || v_key_b(i);
+                END LOOP;
+
+                IF v_key_b.COUNT = 0 THEN
+                    -- B ne porte aucune contrainte de clé : la correspondance
+                    -- reste possible via la clé A, simple signal d'attention.
+                    insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISMATCH', C_SEVERITY_WARNING,
+                        'Cle en A : ' || v_detail_a || ' (B sans PK/UNIQUE)', v_detail_b);
+                ELSE
+                    insert_compat_report(v_check_id, t.table_name, NULL, 'PK_MISMATCH', C_SEVERITY_BLOCKING,
+                        'Cle en A : ' || v_detail_a, 'Cle en B : ' || v_detail_b);
+                    v_blocking := TRUE;
+                END IF;
+            END IF;
 
             v_compare := get_column_comparison(t.table_name);
 
@@ -988,7 +1368,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                                         p_check_id      => p_check_id,
                                         p_table_name    => v_members(i),
                                         p_column_name   => NULL,
-                                        p_issue_type    => 'FK_CYCLE_NOT_DEFERRABLE',
+                                        p_issue_type    => C_ISSUE_FK_CYCLE_DEFERRABLE,
                                         p_severity      => C_SEVERITY_WARNING,
                                         p_detail_a      => 'Cycle deferrable accepte, contraintes differees pour ce run. Membres du cycle : ' || v_cycle_msg,
                                         p_detail_b      => NULL
@@ -1011,7 +1391,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                                         p_check_id      => p_check_id,
                                         p_table_name    => v_members(i),
                                         p_column_name   => NULL,
-                                        p_issue_type    => 'FK_CYCLE_NOT_DEFERRABLE',
+                                        p_issue_type    => C_ISSUE_FK_CYCLE_NOT_DEFERRABLE,
                                         p_severity      => C_SEVERITY_BLOCKING,
                                         p_detail_a      => p_cluster_meta(v_meta_idx).exclusion_reason,
                                         p_detail_b      => NULL
@@ -1090,71 +1470,81 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     -- Variante non aliasée (table nue) ; build_key_expr_aliased, définie
     -- ci-après, correspond à l'appel build_key_expr(cols) avec p_alias NULL.
     ----------------------------------------------------------------------
-    FUNCTION build_key_expr(p_key_cols IN t_str_tab) RETURN VARCHAR2 IS
-        v_expr VARCHAR2(4000) := '';
+    FUNCTION build_key_expr(p_key_cols IN t_str_tab, p_types IN t_coltype_tab) RETURN VARCHAR2 IS
     BEGIN
-        FOR i IN 1 .. p_key_cols.COUNT LOOP
-            v_expr := v_expr
-                || CASE WHEN i > 1 THEN '||''~~''||' END
-                || 'TO_CHAR(' || sanitize_ident(p_key_cols(i)) || ')';
-        END LOOP;
-        RETURN v_expr;
+        RETURN build_key_hash_expr(p_key_cols, p_types, NULL);
     END build_key_expr;
 
     ----------------------------------------------------------------------
     -- build_row_hash_expr
     --
-    -- Rôle : construit l'expression SQL STANDARD_HASH(...,'SHA256') servant de
-    --        comparaison de ligne entre A et B (cas identiques = hash égal).
-    --        Les colonnes LOB (CLOB/BLOB/NCLOB) sont EXCLUES du hash :
-    --        la concaténation puis le hash de gros LOB sont non fiables/coûteux
-    --        (limite documentée : un UPDATE ne touchant QUE des colonnes LOB
-    --        n'est pas détecté par le diagnostic en v1 — jamais écrit).
-    --        Si aucune colonne hachable (table clé uniquement ou tout LOB),
-    --        retourne une constante : il n'y a alors rien à comparer, seul
-    --        l'INSERT initial a un sens.
-    -- Limite : la concaténation intermédiaire est bornée à VARCHAR2 ;
-    --        au-delà de ~4000 caractères le résultat peut être tronqué
-    --        (hypothèse volumétrique documentée, cf. SYNC_CONFLICT pour un
-    --        cas similaire).
+    -- Rôle : construit l'expression SQL SHA-256 servant de comparaison de
+    --        ligne entre A et B (cas identiques = hash égal). S'applique à
+    --        TOUTES les colonnes synchronisées y compris les LOB : en v1 les
+    --        LOB étaient exclus et un UPDATE ne touchant QUE des colonnes LOB
+    --        n'était jamais détecté (correctif v2).
+    -- Double chemin (décision v2) :
+    --          - concaténation courte (VARCHAR2, < 4000) : chemin rapide
+    --            RAWTOHEX(STANDARD_HASH(...,'SHA256')) — STANDARD_HASH refuse
+    --            les LOB (vérifié Oracle 23), d'où une borne de bascule ;
+    --          - sinon : concaténation CLOB (TO_CLOB par morceau) +
+    --            RAWTOHEX(DBMS_CRYPTO.HASH(...,4)), sans plafond de taille.
+    --        Les BLOB, impossibles à concaténer en CLOB, sont hashés
+    --        isolément en hex puis injectés en texte (lob_hash_expr).
+    -- Si aucune colonne (table vide de colonnes synchronisées), retourne une
+    --        constante déterministe : il n'y a rien à comparer.
     ----------------------------------------------------------------------
     FUNCTION build_row_hash_expr(p_columns IN t_column_tab) RETURN VARCHAR2 IS
-        v_expr   VARCHAR2(4000);
-        v_hashed BOOLEAN := FALSE;
+        v_expr   VARCHAR2(32000);
+        v_piece  VARCHAR2(32000);
+        v_est    NUMBER := 0;
+        v_fast   BOOLEAN;
     BEGIN
-        FOR i IN 1 .. p_columns.COUNT LOOP
-            IF NOT p_columns(i).is_lob THEN
-                v_expr := v_expr
-                    || CASE WHEN v_expr IS NOT NULL THEN ' || ''~~'' || ' END
-                    || 'TO_CHAR(' || sanitize_ident(p_columns(i).column_name) || ')';
-                v_hashed := TRUE;
-            END IF;
-        END LOOP;
-
-        IF NOT v_hashed THEN
-            RETURN 'STANDARD_HASH(''NO_HASHABLE_COLUMN'',''SHA256'')';
+        IF p_columns.COUNT = 0 THEN
+            RETURN sql_literal('NO_HASHABLE_COLUMN');
         END IF;
 
-        RETURN 'STANDARD_HASH(' || v_expr || ',''SHA256'')';
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            v_est := v_est + approx_text_len(p_columns(i)) + 4;  -- + 4 = '~~'
+        END LOOP;
+        v_fast := (v_est < 4000);
+
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            IF p_columns(i).is_lob THEN
+                v_piece := lob_hash_expr(p_columns(i), NULL);
+            ELSIF v_fast THEN
+                v_piece := canonical_scalar_expr(p_columns(i), NULL);
+            ELSE
+                v_piece := 'TO_CLOB(' || canonical_scalar_expr(p_columns(i), NULL) || ')';
+            END IF;
+
+            v_expr := v_expr
+                || CASE WHEN i > 1 THEN ' ||' || sql_literal('~~') || ' || ' END
+                || v_piece;
+        END LOOP;
+
+        IF v_fast THEN
+            RETURN 'RAWTOHEX(STANDARD_HASH(' || v_expr || ',' || sql_literal('SHA256') || '))';
+        END IF;
+
+        RETURN 'RAWTOHEX(DBMS_CRYPTO.HASH(' || v_expr || ',4))';
     END build_row_hash_expr;
 
     ----------------------------------------------------------------------
     -- build_key_expr_aliased
     --
-    -- Variante de build_key_expr (Partie 4) acceptant un préfixe d'alias de
-    -- table optionnel, nécessaire ici car les colonnes de clé sont évaluées
-    -- dans le contexte d'une sous-requête (pas de la table nue).
+    -- Variante de build_key_expr acceptant un préfixe d'alias de table
+    -- optionnel, nécessaire ici car les colonnes de clé sont évaluées dans le
+    -- contexte d'une sous-requête (pas de la table nue). Délègue le hachage
+    -- canonique (NLS-safe, seuil 4000, CLOB de secours) à build_key_hash_expr.
     ----------------------------------------------------------------------
-    FUNCTION build_key_expr_aliased(p_key_cols IN t_str_tab, p_alias IN VARCHAR2) RETURN VARCHAR2 IS
-        v_expr  VARCHAR2(4000) := '';
-        v_pfx   VARCHAR2(130)  := CASE WHEN p_alias IS NOT NULL THEN p_alias || '.' END;
+    FUNCTION build_key_expr_aliased(
+        p_key_cols IN t_str_tab,
+        p_alias    IN VARCHAR2,
+        p_types    IN t_coltype_tab
+    ) RETURN VARCHAR2 IS
     BEGIN
-        FOR i IN 1 .. p_key_cols.COUNT LOOP
-            v_expr := v_expr
-                || CASE WHEN i > 1 THEN '||''~~''||' END
-                || 'TO_CHAR(' || v_pfx || sanitize_ident(p_key_cols(i)) || ')';
-        END LOOP;
-        RETURN v_expr;
+        RETURN build_key_hash_expr(p_key_cols, p_types, p_alias);
     END build_key_expr_aliased;
 
 
@@ -1189,6 +1579,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_set       VARCHAR2(4000);
         v_src_cols  VARCHAR2(4000);
         v_table     VARCHAR2(128) := sanitize_ident(p_table_name);
+        v_types     t_coltype_tab := type_map_from_columns(p_columns);
         v_sql       VARCHAR2(4000);
     BEGIN
         SELECT COUNT(*) INTO p_rows_inserted FROM SYNC_WORK_DIFF
@@ -1205,7 +1596,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_sql :=
             'MERGE INTO ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table || ' tgt ' ||
             'USING (SELECT ' || v_all_cols || ' FROM ' || b_table_ref(p_table_name) ||
-            ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL) ||
+            ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL, v_types) ||
             ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :tn ' ||
             '     AND direction = :dir)) src ' ||
             'ON (' || build_on_clause(p_key_cols, 'tgt', 'src') || ') ' ||
@@ -1255,6 +1646,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_set       VARCHAR2(4000);
         v_src_cols  VARCHAR2(4000);
         v_table     VARCHAR2(128) := sanitize_ident(p_table_name);
+        v_types     t_coltype_tab := type_map_from_columns(p_columns);
         v_sql       VARCHAR2(4000);
         v_non_key_cols VARCHAR2(4000);
         v_select_non_key VARCHAR2(4000);
@@ -1279,7 +1671,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 'INSERT INTO ' || b_table_ref(p_table_name) ||
                 ' (' || v_all_cols || ') ' ||
                 'SELECT ' || v_all_cols || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table ||
-                ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL) ||
+                ' WHERE ' || build_key_expr_aliased(p_key_cols, NULL, v_types) ||
                 ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :tn ' ||
                 '     AND diff_type = ''INSERT_TO_B'')';
 
@@ -1313,7 +1705,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 '  SELECT ' || v_select_non_key || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table || ' src ' ||
                 '  WHERE ' || build_on_clause(p_key_cols, 'src', 'tgt') ||
                 ') ' ||
-                'WHERE ' || build_key_expr_aliased(p_key_cols, 'tgt') ||
+                'WHERE ' || build_key_expr_aliased(p_key_cols, 'tgt', v_types) ||
                 ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :tn ' ||
                 '     AND diff_type = ''UPDATE_TO_B'')';
 
@@ -1372,21 +1764,153 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     -- Rôle : calcule et alimante les GTT de travail SYNC_WORK_HASH_A/B avec
     --        les paires (PK_HASH_KEY, ROW_HASH) pour la table donnée.
     --        Côté A : lecture locale. Côté B : lecture distante via SYNC_LINK_B.
-    --        PK_HASH_KEY et ROW_HASH sont générés à l'aide de expressions SQL
-    --        identiques des deux côtés (build_key_expr / build_row_hash_expr)
-    --        pour que la comparaison A/B soit reproductible.
+    --        PK_HASH_KEY et ROW_HASH sont générés selon des règles identiques
+    --        des deux côtés (build_key_expr / build_row_hash_expr) pour que la
+    --        comparaison A/B soit reproductible.
+    --
+    -- Double voie (correctif v2) :
+    --   - SANS colonne LOB : tout est calculé en ENSEMBLE dans une unique
+    --     instruction SQL (chemin rapide STANDARD_HASH, ou chemin DBMS_CRYPTO
+    --     sur CLOB construit en SQL — un CLOB construit en SQL est hashable,
+    --     seul le locator LOB d'une colonne de table ne l'est pas) ;
+    --   - AVEC colonne LOB : passage par ligne en PL/SQL
+    --     (populate_work_hash_lob), seul endroit où le locator LOB est
+    --     exploitable pour un hash complet (limite Oracle 23 vérifiée
+    --     empiriquement : ORA-00932/ORA-00902 dès que DBMS_CRYPTO ou
+    --     STANDARD_HASH rencontre une colonne LOB en SQL).
     ----------------------------------------------------------------------
+    PROCEDURE populate_work_hash_lob(
+        p_run_id        IN NUMBER,
+        p_table_name    IN VARCHAR2,
+        p_key_cols      IN t_str_tab,
+        p_columns       IN t_column_tab,
+        p_side          IN VARCHAR2    -- 'A' : source = SCHEMA_A, GTT = SYNC_WORK_HASH_A
+    ) IS
+        v_types     t_coltype_tab := type_map_from_columns(p_columns);
+        v_pk_expr   VARCHAR2(32000) := build_key_hash_expr(p_key_cols, v_types, NULL);
+        v_src       VARCHAR2(300);
+        v_gtt       VARCHAR2(30);
+        v_sql       VARCHAR2(32000);
+        v_piece     VARCHAR2(32000);
+        v_cur       INTEGER;
+        v_ncols     NUMBER;
+        v_pk        VARCHAR2(64);
+        v_scalar    VARCHAR2(4000);
+        v_clob      CLOB;
+        v_blob      BLOB;
+        v_final     CLOB := NULL;
+        v_sep       VARCHAR2(4) := '~~';
+        v_rowhash   VARCHAR2(64);
+        v_fetched   INTEGER;
+        v_idx       NUMBER;
+    BEGIN
+        IF p_side = 'A' THEN
+            v_src := sanitize_ident(C_SCHEMA_A) || '.' || sanitize_ident(p_table_name);
+            v_gtt := 'SYNC_WORK_HASH_A';
+        ELSE
+            v_src := b_table_ref(p_table_name);
+            v_gtt := 'SYNC_WORK_HASH_B';
+        END IF;
+
+        -- SELECT : clé hashée + une expression par colonne synchronisée.
+        v_sql := 'SELECT ' || v_pk_expr;
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            IF p_columns(i).is_lob AND p_columns(i).data_type = 'BLOB' THEN
+                v_piece := sanitize_ident(p_columns(i).column_name);
+            ELSIF p_columns(i).is_lob THEN
+                -- CLOB/NCLOB : rapatrié en CLOB (TO_CLOB normalise le NCLOB)
+                v_piece := 'TO_CLOB(' || sanitize_ident(p_columns(i).column_name) || ')';
+            ELSE
+                v_piece := canonical_scalar_expr(p_columns(i), NULL);
+            END IF;
+            v_sql := v_sql || ', ' || v_piece;
+        END LOOP;
+        v_sql := v_sql || ' FROM ' || v_src;
+
+        v_cur := DBMS_SQL.OPEN_CURSOR;
+        DBMS_SQL.PARSE(v_cur, v_sql, DBMS_SQL.NATIVE);
+        DBMS_SQL.DEFINE_COLUMN(v_cur, 1, v_pk, 64);
+        v_idx := 2;
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            IF p_columns(i).is_lob AND p_columns(i).data_type = 'BLOB' THEN
+                DBMS_SQL.DEFINE_COLUMN(v_cur, v_idx, v_blob);
+            ELSIF p_columns(i).is_lob THEN
+                DBMS_SQL.DEFINE_COLUMN(v_cur, v_idx, v_clob);
+            ELSE
+                DBMS_SQL.DEFINE_COLUMN(v_cur, v_idx, v_scalar, 4000);
+            END IF;
+            v_idx := v_idx + 1;
+        END LOOP;
+
+        v_ncols := DBMS_SQL.EXECUTE(v_cur);
+
+        LOOP
+            v_fetched := DBMS_SQL.FETCH_ROWS(v_cur);
+            EXIT WHEN v_fetched = 0;
+
+            DBMS_SQL.COLUMN_VALUE(v_cur, 1, v_pk);
+
+            v_final := NULL;
+            v_idx := 2;
+            FOR i IN 1 .. p_columns.COUNT LOOP
+                IF p_columns(i).is_lob AND p_columns(i).data_type = 'BLOB' THEN
+                    DBMS_SQL.COLUMN_VALUE(v_cur, v_idx, v_blob);
+                    IF v_blob IS NULL THEN
+                        v_final := v_final || v_sep || '<NULL>';
+                    ELSE
+                        v_final := v_final || v_sep || RAWTOHEX(DBMS_CRYPTO.HASH(v_blob, 4));
+                    END IF;
+                ELSIF p_columns(i).is_lob THEN
+                    DBMS_SQL.COLUMN_VALUE(v_cur, v_idx, v_clob);
+                    IF v_clob IS NULL THEN
+                        v_final := v_final || v_sep || '<NULL>';
+                    ELSE
+                        v_final := v_final || v_sep || v_clob;
+                    END IF;
+                ELSE
+                    DBMS_SQL.COLUMN_VALUE(v_cur, v_idx, v_scalar);
+                    v_final := v_final || v_sep || NVL(v_scalar, '<NULL>');
+                END IF;
+                v_idx := v_idx + 1;
+            END LOOP;
+
+            v_rowhash := RAWTOHEX(DBMS_CRYPTO.HASH(v_final, 4));
+
+            EXECUTE IMMEDIATE
+                'INSERT INTO ' || v_gtt || ' (run_id, table_name, pk_hash_key, row_hash) ' ||
+                'VALUES (:1, :2, :3, :4)'
+                USING p_run_id, p_table_name, v_pk, v_rowhash;
+        END LOOP;
+
+        DBMS_SQL.CLOSE_CURSOR(v_cur);
+    END populate_work_hash_lob;
+
+
     PROCEDURE populate_work_hash(
         p_run_id        IN NUMBER,
         p_table_name    IN VARCHAR2,
         p_key_cols      IN t_str_tab,
         p_columns       IN t_column_tab
     ) IS
-        v_key_expr  VARCHAR2(4000) := build_key_expr(p_key_cols);
-        v_hash_expr VARCHAR2(4000) := build_row_hash_expr(p_columns);
-        v_table     VARCHAR2(128)  := sanitize_ident(p_table_name);
-        v_sql       VARCHAR2(4000);
+        v_key_expr  VARCHAR2(32000) := build_key_expr(p_key_cols, type_map_from_columns(p_columns));
+        v_hash_expr VARCHAR2(32000) := build_row_hash_expr(p_columns);
+        v_table     VARCHAR2(128)   := sanitize_ident(p_table_name);
+        v_sql       VARCHAR2(32000);
+        v_has_lob   BOOLEAN := FALSE;
     BEGIN
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            IF p_columns(i).is_lob THEN
+                v_has_lob := TRUE;
+                EXIT;
+            END IF;
+        END LOOP;
+
+        IF v_has_lob THEN
+            populate_work_hash_lob(p_run_id, p_table_name, p_key_cols, p_columns, 'A');
+            populate_work_hash_lob(p_run_id, p_table_name, p_key_cols, p_columns, 'B');
+            RETURN;
+        END IF;
+
         -- Côté A (local)
         v_sql := 'INSERT INTO SYNC_WORK_HASH_A (run_id, table_name, pk_hash_key, row_hash) ' ||
                  'SELECT :rid, :tn, ' || v_key_expr || ', ' || v_hash_expr ||
@@ -1431,92 +1955,83 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     END run_diagnostic;
 
     ----------------------------------------------------------------------
-    -- log_conflict
+    -- log_conflicts_for_table
     --
-    -- Rôle : journalise une ligne dans SYNC_CONFLICT (conflit réel résolu,
-    --        écart forcé par direction unique, ou conflit non résolu en
-    --        ERROR_ON_CONFLICT). VALUE_A/VALUE_B portent la sérialisation
-    --        JSON des lignes concernées (colonnes synchronisées non-LOB) à
-    --        l'instant du diagnostic ; la référence de ligne est reconstruite
-    --        en re-calculant le hash de clé des deux côtés (la clé effective
-    --        étant unique par construction, le résultat est déterministe).
+    -- Rôle : journalise en ENSEMBLE (un unique INSERT...SELECT, plus aucune
+    --        itération ligne à ligne) toutes les lignes conflictuelles de la
+    --        table dans SYNC_CONFLICT. C'est le remplacement v2 de log_conflict
+    --        (N+1 : 3 requêtes dynamiques + 1 insert par conflit) qui corrige
+    --        le point de performance identifié sur les volumes de conflits.
+    -- VALUE_A/VALUE_B portent la sérialisation JSON des lignes concernées
+    --        (colonnes non-LOB) à l'instant du diagnostic ; les deux côtés
+    --        sont joignables au hash de clé déjà stocké dans SYNC_WORK_DIFF
+    --        (clé unique par construction -> correspondance déterministe).
     ----------------------------------------------------------------------
-    PROCEDURE log_conflict(
-        p_run_id             IN  NUMBER,
-        p_table_name         IN  VARCHAR2,
-        p_pk_hash_key        IN  VARCHAR2,
-        p_key_cols           IN  t_str_tab,
-        p_resolution_strategy IN VARCHAR2,
-        p_resolved_side      IN  VARCHAR2
+    PROCEDURE log_conflicts_for_table(
+        p_run_id              IN  NUMBER,
+        p_table_name          IN  VARCHAR2,
+        p_key_cols            IN  t_str_tab,
+        p_resolution_strategy IN  VARCHAR2,
+        p_resolved_side       IN  VARCHAR2
     ) IS
-        v_columns  t_column_tab;
-        v_table    VARCHAR2(128) := sanitize_ident(p_table_name);
-        v_jo_cols  VARCHAR2(4000);
-        v_sel_disp VARCHAR2(4000);
-        v_hdest    VARCHAR2(4000);
-        v_display  VARCHAR2(4000);
-        v_value_a  CLOB;
-        v_value_b  CLOB;
-        v_sql      VARCHAR2(4000);
+        v_columns   t_column_tab;
+        v_types     t_coltype_tab;
+        v_table     VARCHAR2(128)  := sanitize_ident(p_table_name);
+        v_jo_cols   VARCHAR2(32000);
+        v_sel_disp  VARCHAR2(32000);
+        v_json_expr VARCHAR2(32000) := 'NULL';
+        v_hkey      VARCHAR2(32000);
+        v_sql       VARCHAR2(32000);
+        v_b_ref     VARCHAR2(300);
     BEGIN
         v_columns := get_sync_columns(p_table_name, p_key_cols);
-        v_hdest   := build_key_expr(p_key_cols);
+        v_types   := get_col_type_map(p_table_name);
+        v_hkey    := build_key_hash_expr(p_key_cols, v_types, NULL);
 
-        -- Liste des colonnes sérialisées en JSON (LOBs exclus : non fiables/
-        -- coûteux, cf. build_row_hash_expr).
+        -- Liste des colonnes sérialisées en JSON (LOBs exclus : coûteux et
+        -- non fiables en sérialisation, cf. build_row_hash_expr).
         FOR i IN 1 .. v_columns.COUNT LOOP
             IF NOT v_columns(i).is_lob THEN
                 v_jo_cols := v_jo_cols
                     || CASE WHEN v_jo_cols IS NOT NULL THEN ', ' END
-                    || 'KEY ''' || v_columns(i).column_name || ''' VALUE '
+                    || 'KEY ' || sql_literal(v_columns(i).column_name) || ' VALUE '
                     || sanitize_ident(v_columns(i).column_name);
             END IF;
         END LOOP;
+        IF v_jo_cols IS NOT NULL THEN
+            v_json_expr := 'JSON_OBJECT(' || v_jo_cols || ')';
+        END IF;
 
-        -- Représentation lisible "CLIENT_ID=10, ..." depuis le côté A
-        -- (fallback : hash brut si ligne absente).
+        -- Représentation lisible "CLIENT_ID=10, ..." (fallback : hash brut si
+        -- ligne absente côté A — ne devrait pas arriver pour un conflit, dont
+        -- la clé existe des deux côtés par construction).
         FOR i IN 1 .. p_key_cols.COUNT LOOP
             v_sel_disp := v_sel_disp
                 || CASE WHEN i > 1 THEN ' || '', '' || ' END
-                || '''' || p_key_cols(i) || '='' || TO_CHAR(' || sanitize_ident(p_key_cols(i)) || ')';
+                || sql_literal(p_key_cols(i) || '=') || ' || TO_CHAR(' || sanitize_ident(p_key_cols(i)) || ')';
         END LOOP;
-        v_sql := 'SELECT ' || v_sel_disp
-                 || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table
-                 || ' WHERE ' || v_hdest || ' = :h';
-        BEGIN
-            EXECUTE IMMEDIATE v_sql INTO v_display USING p_pk_hash_key;
-        EXCEPTION
-            WHEN NO_DATA_FOUND THEN v_display := p_pk_hash_key;
-        END;
 
-        IF v_jo_cols IS NOT NULL THEN
-            v_sql := 'SELECT JSON_OBJECT(' || v_jo_cols || ')'
-                     || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table
-                     || ' WHERE ' || v_hdest || ' = :h';
-            BEGIN
-                EXECUTE IMMEDIATE v_sql INTO v_value_a USING p_pk_hash_key;
-            EXCEPTION
-                WHEN NO_DATA_FOUND THEN v_value_a := NULL;
-            END;
+        v_b_ref := b_table_ref(p_table_name);
 
-            v_sql := 'SELECT JSON_OBJECT(' || v_jo_cols || ')'
-                     || ' FROM ' || b_table_ref(p_table_name)
-                     || ' WHERE ' || v_hdest || ' = :h';
-            BEGIN
-                EXECUTE IMMEDIATE v_sql INTO v_value_b USING p_pk_hash_key;
-            EXCEPTION
-                WHEN NO_DATA_FOUND THEN v_value_b := NULL;
-            END;
-        END IF;
+        v_sql :=
+            'INSERT INTO SYNC_CONFLICT (conflict_id, run_id, table_name, pk_hash_key, pk_display, ' ||
+            '                            value_a, value_b, resolution_strategy, resolved_side) ' ||
+            'SELECT SYNC_CONFLICT_ID_SEQ.NEXTVAL, :rid, :tn, w.pk_hash_key, ' ||
+            '       NVL(sa.disp, w.pk_hash_key), sa.json_v, sb.json_v, :strat, :side ' ||
+            'FROM SYNC_WORK_DIFF w ' ||
+            'LEFT JOIN (SELECT ' || v_hkey || ' AS pk_h, ' || v_sel_disp || ' AS disp, ' ||
+            v_json_expr || ' AS json_v ' ||
+            '            FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || v_table || ') sa ' ||
+            '       ON sa.pk_h = w.pk_hash_key ' ||
+            'LEFT JOIN (SELECT ' || v_hkey || ' AS pk_h, ' || v_json_expr || ' AS json_v ' ||
+            '            FROM ' || v_b_ref || ') sb ' ||
+            '       ON sb.pk_h = w.pk_hash_key ' ||
+            'WHERE w.run_id = ' || p_run_id ||
+            '  AND w.table_name = ' || sql_literal(p_table_name) ||
+            '  AND w.diff_type = ''CONFLICT_CANDIDATE''';
 
-        INSERT INTO SYNC_CONFLICT (
-            conflict_id, run_id, table_name, pk_hash_key, pk_display,
-            value_a, value_b, resolution_strategy, resolved_side
-        ) VALUES (
-            SYNC_CONFLICT_ID_SEQ.NEXTVAL, p_run_id, p_table_name, p_pk_hash_key, v_display,
-            v_value_a, v_value_b, p_resolution_strategy, p_resolved_side
-        );
-    END log_conflict;
+        EXECUTE IMMEDIATE v_sql USING p_run_id, p_table_name, p_resolution_strategy, p_resolved_side;
+    END log_conflicts_for_table;
 
     ----------------------------------------------------------------------
     -- resolve_table_diffs
@@ -1573,14 +2088,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END IF;
 
         ------------------------------------------------------------------
-        -- 2) Conflits candidats : résolution ligne par ligne
+        -- 2) Conflits candidats : résolution ENSEMBLISTE. La règle est
+        --    constante par table (direction ou stratégie de conflit) :
+        --    une seule décision s'applique à toutes les lignes
+        --    CONFLICT_CANDIDATE, plus aucune itération ligne à ligne.
         ------------------------------------------------------------------
-        FOR rec IN (
-            SELECT pk_hash_key FROM SYNC_WORK_DIFF
-            WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'CONFLICT_CANDIDATE'
-        ) LOOP
-
-            IF v_direction = C_DIRECTION_A_TO_B THEN
+        IF v_direction = C_DIRECTION_A_TO_B THEN
                 v_final_diff_type := 'UPDATE_TO_B';
                 v_final_direction := C_DIRECTION_A_TO_B;
                 v_resolution_strategy := 'DIRECTION_FORCED';
@@ -1611,14 +2124,14 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 v_resolved_side := NULL;
             END IF;
 
+            -- Décision unique pour TOUTES les lignes de la table (la règle de
+            -- résolution est constante par table) : application ensembliste.
             UPDATE SYNC_WORK_DIFF
             SET diff_type = v_final_diff_type, direction = v_final_direction
-            WHERE run_id = p_run_id AND table_name = p_table_name AND pk_hash_key = rec.pk_hash_key;
+            WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'CONFLICT_CANDIDATE';
 
-            log_conflict(p_run_id, p_table_name, rec.pk_hash_key, p_key_cols,
-                         v_resolution_strategy, v_resolved_side);
-
-        END LOOP;
+            log_conflicts_for_table(p_run_id, p_table_name, p_key_cols,
+                                    v_resolution_strategy, v_resolved_side);
     END resolve_table_diffs;
 
     ----------------------------------------------------------------------
@@ -1677,8 +2190,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         apply_table_diffs(p_run_id, p_table_name, v_key, v_columns, p_dry_run,
             v_ins_atb, v_ins_bta, v_upd_atb, v_upd_bta);
 
-        SELECT COUNT(*) INTO v_conflict_count FROM SYNC_WORK_DIFF
-            WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'CONFLICT';
+        -- Nombre de conflits RÉELS journalisés pour cette table : les écarts
+        -- forcés par une direction unique (DIRECTION_FORCED) ne sont pas des
+        -- conflits bidirectionnels, ils ne pèsent pas dans ce compteur.
+        SELECT COUNT(*) INTO v_conflict_count FROM SYNC_CONFLICT
+            WHERE run_id = p_run_id AND table_name = p_table_name
+              AND resolution_strategy != 'DIRECTION_FORCED';
 
         p_status := CASE WHEN v_conflict_count > 0 THEN C_STATUS_SUCCESS_CONFLICTS ELSE C_STATUS_SUCCESS END;
 
@@ -1944,6 +2461,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         -- SQL), puis on n'utilise plus que cette variable dans le INSERT.
         v_dry_run_flag      VARCHAR2(1) := CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END;
     BEGIN
+        -- Correctif v2 : valider AVANT d'appliquer l'override. Sinon un
+        -- p_db_link invalide était écrit dans g_db_link_b par
+        -- apply_db_link_override AVANT que validate_common_params ne lève
+        -- l'erreur, corrompant l'état de session pour tous les appels suivants.
+        validate_common_params(p_error_mode, p_db_link);
         apply_db_link_override(p_db_link);
 
         INSERT INTO SYNC_RUN_HEADER (run_id, run_type, dry_run, error_mode)
@@ -1975,11 +2497,18 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
               WHERE r.check_id = v_check_id AND r.table_name = stc.table_name AND r.severity = C_SEVERITY_BLOCKING
           );
 
-        SELECT COUNT(DISTINCT table_name) INTO v_excluded_count
-        FROM SYNC_COMPATIBILITY_REPORT
-        WHERE check_id = v_check_id AND severity = C_SEVERITY_BLOCKING;
+        -- TOTAL_TABLES = ensemble de référence : nombre de tables ACTIVES
+        -- avant filtrage des blocages (corrige le bug v1 où total valait le
+        -- sous-ensemble déjà filtré, puis se faisait re-soustraire les mêmes
+        -- tables bloquantes dans compute_final_status -> processed faussé).
+        SELECT COUNT(*) INTO v_total_tables
+        FROM SYNC_TABLE_CONFIG
+        WHERE enabled = 'Y' AND sync_direction != C_DIRECTION_DISABLED;
 
-        v_total_tables := v_active_tables.COUNT;
+        -- Exclues "structurelles" = tables configurées non retenues dans le
+        -- run (blocages de compatibilité). Les exclusions de grappes FK
+        -- (membres de cycle non déferrable) sont ajoutées juste après.
+        v_excluded_count := v_total_tables - v_active_tables.COUNT;
 
         ------------------------------------------------------------------
         -- 2) Grappes FK (référence CHECK_ID pour la journalisation des cycles)
@@ -2034,7 +2563,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         -- 4) Statut final
         ------------------------------------------------------------------
         v_final_status := compute_final_status(
-            v_active_tables.COUNT, v_success_count, v_conflict_count, v_failed_count, v_excluded_count
+            v_total_tables, v_success_count, v_conflict_count, v_failed_count, v_excluded_count
         );
         IF v_stopped_early AND v_final_status = C_STATUS_SUCCESS THEN
             -- Cas limite : arrêt anticipé mais aucune table en échec comptée
@@ -2058,6 +2587,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             -- traitement des grappes (ex. schéma/DB LINK inaccessible dès
             -- CHECK_COMPATIBILITY). Le run est marqué FAILED et l'exception
             -- est propagée à l'appelant, jamais masquée (décision validée).
+            -- ROLLBACK préalable (correctif v2) : on ne doit PAS valider par
+            -- le COMMIT de l'en-tête un éventuel travail de grappe déjà fait
+            -- mais non commité.
+            ROLLBACK;
             UPDATE SYNC_RUN_HEADER SET
                 end_date = SYSTIMESTAMP, status = C_STATUS_FAILED
             WHERE run_id = v_run_id;
@@ -2092,6 +2625,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         -- d'une instruction SQL statique (ORA-00920 sinon).
         v_dry_run_flag  VARCHAR2(1) := CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END;
     BEGIN
+        -- Correctif v2 : valider AVANT d'appliquer l'override (cf. même
+        -- correctif dans SYNC_ALL : évite de corrompre g_db_link_b sur un
+        -- p_db_link invalide).
+        validate_common_params(C_ERROR_MODE_STOP, p_db_link);
         apply_db_link_override(p_db_link);
 
         SELECT COUNT(*) INTO v_exists FROM SYNC_TABLE_CONFIG
@@ -2162,6 +2699,52 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             COMMIT;
             RAISE;
     END SYNC_TABLE;
+
+
+    ----------------------------------------------------------------------
+    -- PURGE_HISTORY  (procédure publique) — cf. spécification (Script 3).
+    --
+    -- Rôle : purge de maintenance des tables d'historique. Tout enregistrement
+    --        strictement antérieur à (SYSTIMESTAMP - p_keep_days) est supprimé.
+    --        Les en-têtes de run ne sont purgés que si aucune ligne SYNC_LOG
+    --        ne dépend encore d'eux (le run en cours d'un autre run résiduel
+    --        n'est jamais cassé). Correctif v2 : automatisé, alors que le
+    --        Script 2 signalait simplement cette purge comme "à prévoir".
+    ----------------------------------------------------------------------
+    PROCEDURE PURGE_HISTORY (
+        p_keep_days IN NUMBER
+    ) IS
+        v_cutoff    TIMESTAMP;
+        v_conflict  NUMBER := 0;
+        v_compat    NUMBER := 0;
+        v_log       NUMBER := 0;
+        v_header    NUMBER := 0;
+    BEGIN
+        IF p_keep_days IS NULL OR p_keep_days <= 0 THEN
+            RAISE_APPLICATION_ERROR(-20011,
+                'Parametre p_keep_days strictement positif attendu, recu : [' ||
+                TO_CHAR(p_keep_days) || ']');
+        END IF;
+
+        v_cutoff := SYSTIMESTAMP - p_keep_days;
+
+        DELETE FROM SYNC_CONFLICT WHERE resolved_date < v_cutoff;
+        v_conflict := SQL%ROWCOUNT;
+
+        DELETE FROM SYNC_COMPATIBILITY_REPORT WHERE check_date < v_cutoff;
+        v_compat := SQL%ROWCOUNT;
+
+        DELETE FROM SYNC_LOG WHERE start_date < v_cutoff;
+        v_log := SQL%ROWCOUNT;
+
+        DELETE FROM SYNC_RUN_HEADER h
+        WHERE h.start_date < v_cutoff
+          AND NOT EXISTS (SELECT 1 FROM SYNC_LOG l WHERE l.run_id = h.run_id);
+        v_header := SQL%ROWCOUNT;
+
+        DBMS_OUTPUT.PUT_LINE('PURGE_HISTORY(' || p_keep_days || ') - enregistrements supprimes : conflicts=' 
+            || v_conflict || ', compatibility=' || v_compat || ', logs=' || v_log || ', headers=' || v_header);
+    END PURGE_HISTORY;
 
 
     ----------------------------------------------------------------------

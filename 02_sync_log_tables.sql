@@ -154,7 +154,10 @@ CREATE TABLE SYNC_CONFLICT (
     RUN_ID               NUMBER          NOT NULL,
     TABLE_NAME           VARCHAR2(128)   NOT NULL,
 
-    PK_HASH_KEY          VARCHAR2(4000)  NOT NULL,  -- valeur concaténée des colonnes de clé
+    -- PK_HASH_KEY : SHA-256 hexadécimal (64 caractères) de la concaténation
+    -- canonique des colonnes de clé. Le hachage (et non la concaténation
+    -- brute) évite tout dépassement VARCHAR2 sur les clés composites longues.
+    PK_HASH_KEY          VARCHAR2(64)    NOT NULL,
     PK_DISPLAY            VARCHAR2(4000),             -- représentation lisible "CLIENT_ID=10" pour audit humain
 
     VALUE_A               CLOB,           -- sérialisation JSON de la ligne côté A au moment du diagnostic
@@ -226,6 +229,8 @@ CREATE TABLE SYNC_COMPATIBILITY_REPORT (
     -- PK_MISMATCH                     : clé différente entre A et B
     -- UNSUPPORTED_TYPE                : LONG/LONG RAW/objet/VARRAY/XMLType
     -- KEY_NOT_UNIQUE                  : clé configurée manuellement mais non unique en pratique
+    -- FK_CYCLE_DEFERRABLE             : cycle FK détecté mais entièrement déferrable (accepté, WARNING)
+    -- FK_CYCLE_NOT_DEFERRABLE         : cycle FK comportant une contrainte non déferrable (grappe exclue, BLOCKING)
     ISSUE_TYPE       VARCHAR2(30)    NOT NULL,
 
     -- BLOCKING : la table est automatiquement exclue du run tant que
@@ -244,7 +249,7 @@ CREATE TABLE SYNC_COMPATIBILITY_REPORT (
         CHECK (ISSUE_TYPE IN (
             'MISSING_IN_A','MISSING_IN_B','TYPE_MISMATCH','LENGTH_MISMATCH',
             'NULLABLE_MISMATCH','PK_MISSING','PK_MISMATCH','UNSUPPORTED_TYPE',
-            'KEY_NOT_UNIQUE'
+            'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE'
         )),
 
     CONSTRAINT CK_SCR_SEVERITY
@@ -290,8 +295,8 @@ COMMENT ON TABLE SYNC_COMPATIBILITY_REPORT IS
 CREATE GLOBAL TEMPORARY TABLE SYNC_WORK_HASH_A (
     RUN_ID          NUMBER          NOT NULL,
     TABLE_NAME      VARCHAR2(128)   NOT NULL,
-    PK_HASH_KEY     VARCHAR2(4000)  NOT NULL,
-    ROW_HASH        VARCHAR2(64)    NOT NULL   -- STANDARD_HASH(...,'SHA256') en hexadécimal
+    PK_HASH_KEY     VARCHAR2(64)    NOT NULL,  -- SHA-256 hexadécimal de la clé canonique
+    ROW_HASH        VARCHAR2(64)    NOT NULL   -- SHA-256 hexadécimal de la ligne canonique
 ) ON COMMIT PRESERVE ROWS;
 
 CREATE INDEX IX_SWHA_LOOKUP ON SYNC_WORK_HASH_A (RUN_ID, TABLE_NAME, PK_HASH_KEY);
@@ -299,8 +304,8 @@ CREATE INDEX IX_SWHA_LOOKUP ON SYNC_WORK_HASH_A (RUN_ID, TABLE_NAME, PK_HASH_KEY
 CREATE GLOBAL TEMPORARY TABLE SYNC_WORK_HASH_B (
     RUN_ID          NUMBER          NOT NULL,
     TABLE_NAME      VARCHAR2(128)   NOT NULL,
-    PK_HASH_KEY     VARCHAR2(4000)  NOT NULL,
-    ROW_HASH        VARCHAR2(64)    NOT NULL
+    PK_HASH_KEY     VARCHAR2(64)    NOT NULL,  -- SHA-256 hexadécimal de la clé canonique
+    ROW_HASH        VARCHAR2(64)    NOT NULL   -- SHA-256 hexadécimal de la ligne canonique
 ) ON COMMIT PRESERVE ROWS;
 
 CREATE INDEX IX_SWHB_LOOKUP ON SYNC_WORK_HASH_B (RUN_ID, TABLE_NAME, PK_HASH_KEY);
@@ -314,7 +319,7 @@ COMMENT ON TABLE SYNC_WORK_HASH_B IS
 CREATE GLOBAL TEMPORARY TABLE SYNC_WORK_DIFF (
     RUN_ID          NUMBER          NOT NULL,
     TABLE_NAME      VARCHAR2(128)   NOT NULL,
-    PK_HASH_KEY     VARCHAR2(4000)  NOT NULL,
+    PK_HASH_KEY     VARCHAR2(64)    NOT NULL,  -- SHA-256 hexadécimal de la clé canonique
 
     -- Classification issue de la comparaison SYNC_WORK_HASH_A / SYNC_WORK_HASH_B :
     -- INSERT_TO_A / INSERT_TO_B : présente d'un seul côté, à ajouter de l'autre

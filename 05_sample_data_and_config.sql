@@ -6,6 +6,13 @@
 --   (2) connecté en SCHEMA_B (ou via la base distante) : bloc "PARTIE B"
 --   (3) connecté en SYNC_ADMIN : bloc "PARTIE CONFIG" + grants
 --
+-- Prérequis (une seule fois, à exécuter avec un compte privilégié : SYS) :
+--   GRANT EXECUTE ON DBMS_CRYPTO TO SYNC_ADMIN;
+-- Nécessaire au hachage des colonnes LOB (chemin lent DBMS_CRYPTO, décision
+-- v2) : le package s'exécute sous le schéma SYNC_ADMIN, qui doit disposer de
+-- l'autorisation d'appeler DBMS_CRYPTO.HASH. Sans ce grant, toute table
+-- contenant un LOB échoue au run avec ORA-00904 "DBMS_CRYPTO"."HASH".
+--
 -- Jeu d'exemple repris du cahier des charges initial : CLIENT, PRODUIT,
 -- COMMANDE, COMMANDE_LIGNE, avec un cas de clé composite (COMMANDE_LIGNE)
 -- et une chaîne de dépendances FK CLIENT -> COMMANDE -> COMMANDE_LIGNE
