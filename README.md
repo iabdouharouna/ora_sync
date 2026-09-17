@@ -20,6 +20,7 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 6. [Annexes](#6-annexes)
 7. [Changelog v2](#7-changelog-v2)
 8. [Changelog v3](#8-changelog-v3)
+9. [Outillage de déploiement et industrialisation](#9-outillage-de-déploiement-et-industrialisation)
 
 ---
 
@@ -405,6 +406,8 @@ Ce document de spécifications accompagne les livrables techniques suivants, pro
 - **Script 6** — Jeu de tests fonctionnels guidés (18 scénarios)
 - **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL, non destructif)
 - **Script 8** — Migration v1 → v2/v3 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT, `SYNC_MODE` / `RUN_TYPE`)
+- **Script 9** — Démonstration des modes de synchronisation (`INSERT`, `UPDATE`, `INSERT_UPDATE` et mode par table), avec remise à l'état initial (optionnel)
+- **Outillage** — `setup_project.py` + package `tools/orasync` (déploiement, tests et diagnostic en ligne de commande, cf. [§9](#9-outillage-de-déploiement-et-industrialisation))
 
 ---
 
@@ -432,3 +435,63 @@ Récapitulatif des correctifs et durcissements apportés en v2 par rapport au do
 - **Refactoring interne** : phase d'exécution des grappes factorisée (`execute_clusters`) entre `SYNC_ALL` et `SYNC_TABLES` ; résolution du mode effectif (`resolve_effective_mode`) et expansion des ancêtres FK (`expand_fk_ancestors`).
 - **Migration** : Script 8 étendu (idempotent) — ajout de `SYNC_TABLE_CONFIG.SYNC_MODE`, `SYNC_LOG.SYNC_MODE` et élargissement de `CK_SRH_RUN_TYPE`.
 - **Tests** : harnais Script 7 porté à 8 sections et 36 assertions (dont mode + expansion FK) ; Script 6 enrichi des scénarios `SYNC_TABLES` et `SYNC_MODE`. Validation : run réel `SYNC_TABLES(['COMMANDE_LIGNE'])` → 4 tables synchronisées `SUCCESS`.
+
+---
+
+## 9. Outillage de déploiement et industrialisation
+
+Le projet fournit un outillage Python autonome qui remplace le client `sqlplus` pour le déploiement et les tests : création de l'environnement virtuel, installation des dépendances, exécution des scripts SQL\*Plus, contrôle des connexions et diagnostic.
+
+### 9.1. Fichiers
+
+| Chemin | Rôle |
+|--------|------|
+| `setup_project.py` | Lanceur *bootstrap* (bibliothèque standard uniquement) : crée `.venv`, installe `requirements.txt`, puis délègue à la CLI |
+| `tools/orasync/` | Package applicatif : `config`, `db`, `sqlplus` (mini-interpréteur SQL\*Plus), `project`, `cli` |
+| `requirements.txt` | Dépendances Python (`oracledb`) |
+| `.env.example` | Modèle de configuration des connexions (à copier en `.env`) |
+
+### 9.2. Démarrage rapide
+
+```bash
+cp .env.example .env          # renseigner les mots de passe
+python3 setup_project.py check
+python3 setup_project.py setup --with-sample --run-tests
+```
+
+Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automatiquement dans l'environnement virtuel. Aucune installation manuelle n'est requise.
+
+### 9.3. Commandes
+
+| Commande | Rôle | Profil(s) utilisé(s) |
+|----------|------|----------------------|
+| `check` | Teste chaque connexion et affiche version/utilisateur | tous |
+| `install [--no-migrate]` | Crée les tables et le package (Scripts 1→4 puis 8) | `admin` |
+| `migrate` | Applique la migration idempotente (Script 8) | `admin` |
+| `sample [--link-user X]` | Charge données et configuration d'exemple (Script 5, sections A/B/CONFIG) | `schema_a`, `schema_b`, `admin` |
+| `test` | Exécute le harnais de validation (Script 7) | `admin` |
+| `setup [--with-sample] [--run-tests]` | Enchaîne `install` [+ `sample`] [+ `test`] | selon étape |
+| `sql <fichier> [--profile P] [--continue-on-error]` | Exécute un script SQL\*Plus arbitraire | `admin` par défaut |
+| `status [--limit N]` | Affiche les dernières exécutions (`SYNC_RUN_HEADER`) | `admin` |
+
+Options globales : `--env-file`, `-v`/`-vv` (verbosité), `--dry-run` (affiche les actions sans exécuter les scripts).
+
+### 9.4. Configuration par variables d'environnement
+
+Les connexions sont décrites par des variables préfixées `ORASYNC_`, chargées depuis `.env` (sans écraser l'environnement du shell) :
+
+| Variable | Rôle |
+|----------|------|
+| `ORASYNC_DSN` | DSN commun (Easy Connect `hote:port/service`) |
+| `ORASYNC_<PROFIL>_USER` / `_PASSWORD` / `_DSN` / `_ROLE` | Paramètres par profil (`admin`, `schema_a`, `schema_b`, `sys`) |
+| `ORASYNC_PROFILES` | Liste des profils (défaut `admin,schema_a,schema_b,sys`) |
+| `ORASYNC_LINK_NAME` / `ORASYNC_LINK_USER` | Lien de base de données et utilisateur pour la section B du Script 5 |
+| `ORASYNC_VENV`, `ORASYNC_ENV_FILE`, `ORASYNC_SCRIPTS_DIR`, `ORASYNC_LOG_FILE` | Options de l'outillage |
+
+### 9.5. Comportement et garanties
+
+- **Sémantique SQL\*Plus fidèle** : les commandes (`SET`, `PROMPT`, `COLUMN`, `SHOW`, `@`, `EXEC`…) ne sont reconnues que hors tampon de requête ; les blocs PL/SQL sont terminés par `/`, les instructions SQL par `;` ; `DBMS_OUTPUT` est restitué et les erreurs de compilation sont lues dans `USER_ERRORS`.
+- **Installation tolérante** : `install`, `migrate` et `sample` ignorent les erreurs DDL d'idempotence (`ORA-00955`, `ORA-00942`, `ORA-14452`, …) et n'échouent que sur une erreur inattendue. En particulier, la recréation des GTT peut être ignorée si une session tierce (ex. SQL Developer) les utilise — `ORA-14452`.
+- **Tests stricts** : `test` ne tolère aucune erreur ; toute assertion en échec est remontée par le harnais (`RAISE_APPLICATION_ERROR -20999`) et le code de retour du processus est non nul.
+- **Codes de retour** : `0` succès, `1` échec fonctionnel, `2` erreur de configuration/usage.
+- **Sans `ensurepip`** (certaines distributions) : l'environnement est créé sans `pip` puis amorcé via le `pip` de l'hôte (`pip --python`), qui doit être ≥ 22.3. `ORASYNC_NO_VENV=1` force l'utilisation de l'interpréteur courant.

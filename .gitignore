@@ -1,0 +1,24 @@
+# Environnement virtuel et artefacts Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Configuration locale (secrets) : seul .env.example est versionne
+.env
+.env.*
+!.env.example
+
+# Journaux et artefacts d'execution de l'outil
+.orasync/
+*.log
+logs/
+
+# Editeurs / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

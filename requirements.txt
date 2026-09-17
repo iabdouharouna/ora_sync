@@ -1,0 +1,3 @@
+# Dependances Python du projet ora_sync
+# Installees automatiquement par setup_project.py dans le venv local (.venv)
+oracledb>=2.0,<27
