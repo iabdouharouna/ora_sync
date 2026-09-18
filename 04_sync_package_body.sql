@@ -1749,12 +1749,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_rows_inserted     OUT NUMBER,
         p_rows_updated      OUT NUMBER
     ) IS
-        v_all_cols  VARCHAR2(4000);
-        v_set       VARCHAR2(4000);
-        v_src_cols  VARCHAR2(4000);
+        v_all_cols  VARCHAR2(32767);
+        v_set       VARCHAR2(32767);
+        v_src_cols  VARCHAR2(32767);
         v_table     VARCHAR2(128) := sanitize_ident(p_table_name);
         v_types     t_coltype_tab := type_map_from_columns(p_columns);
-        v_sql       VARCHAR2(4000);
+        v_sql       VARCHAR2(32767);
         v_ins       NUMBER;
         v_upd       NUMBER;
         v_diff_list VARCHAR2(120);
@@ -1842,14 +1842,14 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_rows_inserted     OUT NUMBER,
         p_rows_updated      OUT NUMBER
     ) IS
-        v_all_cols  VARCHAR2(4000);
-        v_set       VARCHAR2(4000);
-        v_src_cols  VARCHAR2(4000);
+        v_all_cols  VARCHAR2(32767);
+        v_set       VARCHAR2(32767);
+        v_src_cols  VARCHAR2(32767);
         v_table     VARCHAR2(128) := sanitize_ident(p_table_name);
         v_types     t_coltype_tab := type_map_from_columns(p_columns);
-        v_sql       VARCHAR2(4000);
-        v_non_key_cols VARCHAR2(4000);
-        v_select_non_key VARCHAR2(4000);
+        v_sql       VARCHAR2(32767);
+        v_non_key_cols VARCHAR2(32767);
+        v_select_non_key VARCHAR2(32767);
         v_is_key BOOLEAN;
         v_ins       NUMBER;
         v_upd       NUMBER;
