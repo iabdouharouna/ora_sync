@@ -237,6 +237,8 @@ CREATE TABLE SYNC_COMPATIBILITY_REPORT (
     -- KEY_NOT_UNIQUE                  : clé configurée manuellement mais non unique en pratique
     -- FK_CYCLE_DEFERRABLE             : cycle FK détecté mais entièrement déferrable (accepté, WARNING)
     -- FK_CYCLE_NOT_DEFERRABLE         : cycle FK comportant une contrainte non déferrable (grappe exclue, BLOCKING)
+    -- FK_PARENT_ENROLLED (v4)         : parent FK absent de SYNC_TABLE_CONFIG, auto-enrôlé (WARNING)
+    -- FK_PARENT_DISABLED (v4)         : parent FK présent mais désactivé en config, jamais forcé (WARNING)
     ISSUE_TYPE       VARCHAR2(30)    NOT NULL,
 
     -- BLOCKING : la table est automatiquement exclue du run tant que
@@ -255,7 +257,8 @@ CREATE TABLE SYNC_COMPATIBILITY_REPORT (
         CHECK (ISSUE_TYPE IN (
             'MISSING_IN_A','MISSING_IN_B','TYPE_MISMATCH','LENGTH_MISMATCH',
             'NULLABLE_MISMATCH','PK_MISSING','PK_MISMATCH','UNSUPPORTED_TYPE',
-            'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE'
+            'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE',
+            'FK_PARENT_ENROLLED','FK_PARENT_DISABLED'
         )),
 
     CONSTRAINT CK_SCR_SEVERITY

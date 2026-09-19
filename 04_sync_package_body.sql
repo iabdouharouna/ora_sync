@@ -117,6 +117,23 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     --------------------------------------------------------------------------
+    -- DECLARATIONS FORWARD (v4)
+    --
+    -- build_fk_ancestors_raw et enroll_fk_lineage sont implémentés plus bas
+    -- (partie "expansion / enrôlement de la lignée FK"), mais référencés DÈS
+    -- compat_check_core et CHECK_COMPATIBILITY(NULL) : déclaration anticipée
+    -- obligatoire en PL/SQL (définition plus bas, dans le même body).
+    --------------------------------------------------------------------------
+    FUNCTION build_fk_ancestors_raw(p_tables IN t_str_tab) RETURN t_str_tab;
+
+    PROCEDURE enroll_fk_lineage(
+        p_check_id      IN  NUMBER,
+        p_ancestors     IN  t_str_tab,
+        p_enrolled      OUT NUMBER
+    );
+
+
+    --------------------------------------------------------------------------
     -- sanitize_ident
     --
     -- Rôle    : point de passage OBLIGATOIRE pour tout identifiant (nom de
@@ -917,14 +934,27 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --        unique, remplit SYNC_COMPATIBILITY_REPORT et retourne un flag
     --        "présence d'au moins une anomalie BLOCKING". Règles de sévérité
     --        résumées dans le corps ci-dessous (identique à la v1/v2).
+    --
+    -- v4 : paramètre p_enroll_fk — lorsque TRUE, EN TÊTE du contrôle, toute
+    --        la lignée FK des tables de p_table_names (fermeture transitive
+    --        côté SCHEMA_A) est vérifiée contre SYNC_TABLE_CONFIG et les
+    --        parents absents sont enrôlés automatiquement (enroll_fk_lineage),
+    --        chaque nouveau parent étant signalé (FK_PARENT_ENROLLED) et les
+    --        parents présents mais désactivés signalés sans forçage
+    --        (FK_PARENT_DISABLED), rattachés au MÊME CHECK_ID. p_table_names
+    --        doit alors contenir la fermeture COMPLÈTE (seeds ∪ ancêtres) :
+    --        le bouclage structurel ci-dessous valide aussi les parents
+    --        nouvellement enrôlés. Le COMMIT reste à la charge de l'appelant.
     --------------------------------------------------------------------------
     PROCEDURE compat_check_core(
         p_table_names      IN t_str_tab,
         p_check_id         OUT NUMBER,
-        p_has_blocking     OUT BOOLEAN
+        p_has_blocking     OUT BOOLEAN,
+        p_enroll_fk        IN BOOLEAN DEFAULT FALSE
     ) IS
         v_check_id      NUMBER := SYNC_COMPAT_CHECK_ID_SEQ.NEXTVAL;
         v_blocking      BOOLEAN := FALSE;
+        v_enrolled      NUMBER := 0;
         v_key           t_str_tab;
         v_key_b         t_str_tab;
         v_compare       t_col_compare_tab;
@@ -935,6 +965,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_detail_b      VARCHAR2(4000) := '';
         v_cur_table     VARCHAR2(128);
     BEGIN
+        -- v4 : enrôlement automatique de la lignée FK avant le contrôle
+        -- structurel, rattaché au CHECK_ID généré ci-dessus.
+        IF p_enroll_fk THEN
+            enroll_fk_lineage(v_check_id, p_table_names, v_enrolled);
+        END IF;
+
         FOR t_idx IN 1 .. p_table_names.COUNT LOOP
             v_cur_table := p_table_names(t_idx);
 
@@ -1120,11 +1156,29 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             SELECT table_name BULK COLLECT INTO v_names
             FROM SYNC_TABLE_CONFIG
             WHERE enabled = 'Y';
+
+            -- v4 : fermeture COMPLÈTE de la lignée FK côté SCHEMA_A
+            -- (seeds ∪ ancêtres). La surcharge NULL (contrôle autonome ET
+            -- en-tête de SYNC_ALL) enrôle automatiquement les parents absents
+            -- de SYNC_TABLE_CONFIG et PERSISTE cet enrôlement (COMMIT) ; les
+            -- ancêtres ajoutés sont validés par le MÊME CHECK_ID que les
+            -- seeds. La surcharge mono-table et la surcharge liste
+            -- (pré-validation) restent non mutantes.
+            IF v_names.COUNT > 0 THEN
+                v_names := build_fk_ancestors_raw(v_names);
+            END IF;
         ELSE
             v_names(1) := p_table_name;
         END IF;
 
-        compat_check_core(v_names, p_check_id, p_has_blocking_issues);
+        compat_check_core(v_names, p_check_id, p_has_blocking_issues,
+            p_enroll_fk => (p_table_name IS NULL));
+
+        -- v4 : l'enrôlement automatique de la lignée FK est persisté pour le
+        -- contrôle autonome (CHECK_COMPATIBILITY(NULL)).
+        IF p_table_name IS NULL THEN
+            COMMIT;
+        END IF;
     END CHECK_COMPATIBILITY;
 
     PROCEDURE CHECK_COMPATIBILITY (
@@ -1188,32 +1242,32 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     --------------------------------------------------------------------------
-    -- expand_fk_ancestors
+    -- build_fk_ancestors_raw
     --
-    -- Rôle : reçoit un ensemble de tables (déjà validées comme actives) et
-    --        retourne cet ensemble ∪ sa FERMETURE TRANSITIVE DES PARENTS FK
-    --        (ancêtres via les contraintes FK de SCHEMA_A), restreints aux
-    --        tables de SYNC_TABLE_CONFIG actives (ENABLED='Y' et
-    --        SYNC_DIRECTION != 'DISABLED'). Un parent hors configuration est
-    --        ignoré : hors périmètre de la synchronisation, il ne peut pas
-    --        être ajouté de force (décision de conception, cf. spécification
-    --        de SYNC_TABLES).
+    -- Rôle : reçoit un ensemble de tables et retourne sa FERMETURE TRANSITIVE
+    --        COMPLÈTE DES PARENTS FK (ancêtres via les contraintes FK de
+    --        SCHEMA_A), SANS AUCUN FILTRE DE CONFIGURATION. C'est la couche
+    --        basse (dictionnaire) partagée par expand_fk_ancestors (filtre sur
+    --        les tables de SYNC_TABLE_CONFIG actives) et par enroll_fk_lineage
+    --        (enrôlement automatique de la lignée, v4).
     --
     -- Implémentation : expansion itérative par fronts (fichiers parents des
     --        tables déjà retenues), jusqu'à point fixe (au plus 50 passes de
     --        garde — un cycle FK est traité par la détection de grappes/cycle
     --        existante, cette fonction ne boucle que sur la découverte).
     --        Ordre de sortie déterministe : tables demandées dans leur ordre,
-    --        puis ancêtres dans l'ordre de découverte.
+    --        puis ancêtres dans l'ordre de découverte. Chaque parent n'est
+    --        inséré qu'APRÈS tous ses enfants : cet ordre enfants -> parents
+    --        est exploité par enroll_fk_lineage pour hériter du sens de
+    --        synchronisation de l'enfant.
     --------------------------------------------------------------------------
-    FUNCTION expand_fk_ancestors(p_tables IN t_str_tab) RETURN t_str_tab IS
+    FUNCTION build_fk_ancestors_raw(p_tables IN t_str_tab) RETURN t_str_tab IS
         TYPE t_set IS TABLE OF VARCHAR2(128) INDEX BY VARCHAR2(128);
 
         v_result    t_str_tab;
         v_present   t_set;
         v_count     PLS_INTEGER := 0;
         v_new       PLS_INTEGER;
-        v_cfg       NUMBER;
     BEGIN
         -- 1) Copie dédupliquée des tables demandées (ordre conservé).
         FOR i IN 1 .. p_tables.COUNT LOOP
@@ -1243,18 +1297,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 )
                 LOOP
                     IF NOT v_present.EXISTS(rec.parent_table) THEN
-                        SELECT COUNT(*) INTO v_cfg
-                        FROM SYNC_TABLE_CONFIG
-                        WHERE table_name = rec.parent_table
-                          AND enabled = 'Y'
-                          AND sync_direction != C_DIRECTION_DISABLED;
-
-                        IF v_cfg = 1 THEN
-                            v_count := v_count + 1;
-                            v_result(v_count) := rec.parent_table;
-                            v_present(rec.parent_table) := rec.parent_table;
-                            v_new := v_new + 1;
-                        END IF;
+                        v_count := v_count + 1;
+                        v_result(v_count) := rec.parent_table;
+                        v_present(rec.parent_table) := rec.parent_table;
+                        v_new := v_new + 1;
                     END IF;
                 END LOOP;
             END LOOP;
@@ -1262,7 +1308,196 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END LOOP;
 
         RETURN v_result;
+    END build_fk_ancestors_raw;
+
+
+    --------------------------------------------------------------------------
+    -- expand_fk_ancestors
+    --
+    -- Rôle : ensemble de run de SYNC_TABLES historique = fermeture transitive
+    --        des parents FK restreinte aux tables de SYNC_TABLE_CONFIG ACTIVES
+    --        (ENABLED='Y' et SYNC_DIRECTION != 'DISABLED'). Conservée pour
+    --        compatibilité ; depuis la v4, SYNC_TABLES utilise la fermeture
+    --        COMPLÈTE (build_fk_ancestors_raw) combinée à l'enrôlement
+    --        automatique (enroll_fk_lineage), qui rend ce filtre sans objet.
+    --------------------------------------------------------------------------
+    FUNCTION expand_fk_ancestors(p_tables IN t_str_tab) RETURN t_str_tab IS
+        v_raw       t_str_tab;
+        v_result    t_str_tab;
+        v_idx       PLS_INTEGER := 0;
+        v_cfg       NUMBER;
+    BEGIN
+        v_raw := build_fk_ancestors_raw(p_tables);
+
+        FOR i IN 1 .. v_raw.COUNT LOOP
+            SELECT COUNT(*) INTO v_cfg
+            FROM SYNC_TABLE_CONFIG
+            WHERE table_name = v_raw(i)
+              AND enabled = 'Y'
+              AND sync_direction != C_DIRECTION_DISABLED;
+
+            IF v_cfg = 1 THEN
+                v_idx := v_idx + 1;
+                v_result(v_idx) := v_raw(i);
+            END IF;
+        END LOOP;
+
+        RETURN v_result;
     END expand_fk_ancestors;
+
+
+    --------------------------------------------------------------------------
+    -- enroll_fk_lineage
+    --
+    -- Rôle (v4) : reçoit la FERMETURE COMPLÈTE de la lignée FK (seeds ∪
+    --        ancêtres, ordre enfants -> parents garanti par
+    --        build_fk_ancestors_raw) et vérifie que TOUTE cette lignée est
+    --        présente dans SYNC_TABLE_CONFIG. Un parent ABSENT y est enrôlé
+    --        automatiquement afin de garantir l'ordre d'écriture parent ->
+    --        enfant (évite les ORA-02291 sur SCHEMA_B). Un parent PRÉSENT
+    --        MAIS DÉSACTIVÉ n'est JAMAIS forcé (respect de l'intention de
+    --        l'administrateur) : un WARNING FK_PARENT_DISABLED signale
+    --        l'ordre non garanti.
+    --
+    -- NB : p_ancestors est l'ensemble de validation complet. Les tables de
+    --        fermeture DÉJÀ configurées y figurent (seeds actives ou parents
+    --        déjà enrôlés par un appel précédent) : seules les ABSENTES de
+    --        la configuration déclenchent un enrôlement — d'où l'idempotence.
+    --
+    -- SYNC_DIRECTION des parents enrôlés : hérité du sens de l'enfant FK
+    --        direct actif (unique si possible, ordre enfants -> parents
+    --        garanti par build_fk_ancestors_raw) ; en cas de sens multiples,
+    --        d'absence d'enfant actif ou de BIDIRECTIONAL, la valeur retenue
+    --        est BIDIRECTIONAL (repli le plus permissif, sans sous-propagation).
+    --
+    -- Les lignes du rapport sont rattachées au p_check_id fourni par
+    --        l'appelant (celui du CHECK_COMPATIBILITY en cours).
+    --------------------------------------------------------------------------
+    PROCEDURE enroll_fk_lineage(
+        p_check_id      IN  NUMBER,
+        p_ancestors     IN  t_str_tab,
+        p_enrolled      OUT NUMBER
+    ) IS
+        v_enrolled    NUMBER := 0;
+        v_cfg_count   NUMBER;
+        v_enabled     CHAR(1);
+        v_present_dir VARCHAR2(20);
+        v_any_child   BOOLEAN;
+        v_dir_mixed   BOOLEAN;
+        v_dir_first   VARCHAR2(20);
+        v_dir         VARCHAR2(20);
+        v_children    VARCHAR2(4000);
+    BEGIN
+        FOR i IN 1 .. p_ancestors.COUNT LOOP
+            SELECT COUNT(*) INTO v_cfg_count
+            FROM SYNC_TABLE_CONFIG
+            WHERE table_name = p_ancestors(i);
+
+            IF v_cfg_count = 0 THEN
+                --------------------------------------------------------------
+                -- Parent ABSENT : enrôlement avec direction héritée de l'enfant.
+                --------------------------------------------------------------
+                v_any_child := FALSE;
+                v_dir_mixed := FALSE;
+                v_dir_first := NULL;
+                v_children  := NULL;
+
+                FOR child IN (
+                    SELECT c.table_name AS child_table
+                    FROM ALL_CONSTRAINTS c
+                    JOIN ALL_CONSTRAINTS r
+                      ON c.r_constraint_name = r.constraint_name
+                     AND c.r_owner = r.owner
+                    WHERE c.owner = C_SCHEMA_A
+                      AND c.constraint_type = 'R'
+                      AND c.status = 'ENABLED'
+                      AND r.constraint_type IN ('P', 'U')
+                      AND r.table_name = p_ancestors(i)
+                )
+                LOOP
+                    -- Enfant restreint à l'ensemble de run courant (les enfants
+                    -- arrivent AVANT leur parent dans p_ancestors : un enfant en
+                    -- cours d'enrôlement est donc déjà actif en config) et actif.
+                    IF is_in_list(child.child_table, p_ancestors) THEN
+                        v_present_dir := NULL;
+                        BEGIN
+                            SELECT sync_direction INTO v_present_dir
+                            FROM SYNC_TABLE_CONFIG
+                            WHERE table_name = child.child_table
+                              AND enabled = 'Y'
+                              AND sync_direction != C_DIRECTION_DISABLED;
+                        EXCEPTION
+                            WHEN NO_DATA_FOUND THEN
+                                v_present_dir := NULL;
+                        END;
+
+                        IF v_present_dir IS NOT NULL THEN
+                            v_any_child := TRUE;
+                            v_children := v_children
+                                || CASE WHEN v_children IS NOT NULL THEN ',' END
+                                || child.child_table;
+                            IF v_dir_first IS NULL THEN
+                                v_dir_first := v_present_dir;
+                            ELSIF v_dir_first != v_present_dir THEN
+                                v_dir_mixed := TRUE;
+                            END IF;
+                        END IF;
+                    END IF;
+                END LOOP;
+
+                IF NOT v_any_child OR v_dir_mixed
+                   OR v_dir_first = C_DIRECTION_BIDIRECTIONAL THEN
+                    v_dir := C_DIRECTION_BIDIRECTIONAL;
+                ELSE
+                    v_dir := v_dir_first;
+                END IF;
+
+                INSERT INTO SYNC_TABLE_CONFIG (
+                    table_name, enabled, sync_delete, sync_direction,
+                    sync_mode, conflict_strategy, priority, updated_by
+                ) VALUES (
+                    p_ancestors(i), 'Y', 'N', v_dir,
+                    C_SYNC_MODE_INSERT_UPDATE, C_CONFLICT_ERROR_ON_CONFLICT,
+                    100, 'AUTO_FK_LINEAGE'
+                );
+
+                v_enrolled := v_enrolled + 1;
+
+                insert_compat_report(
+                    p_check_id    => p_check_id,
+                    p_table_name  => p_ancestors(i),
+                    p_column_name => NULL,
+                    p_issue_type  => C_ISSUE_FK_PARENT_ENROLLED,
+                    p_severity    => C_SEVERITY_WARNING,
+                    p_detail_a    => 'Parent FK absent de SYNC_TABLE_CONFIG, enrole automatiquement (SYNC_DIRECTION=' ||
+                                     v_dir || '). Enfants declencheurs : ' || NVL(v_children, '-'),
+                    p_detail_b    => NULL
+                );
+
+            ELSIF v_cfg_count > 0 THEN
+                --------------------------------------------------------------
+                -- Parent PRÉSENT : WARNING si désactivé (jamais de forçage).
+                --------------------------------------------------------------
+                SELECT enabled, sync_direction INTO v_enabled, v_present_dir
+                FROM SYNC_TABLE_CONFIG
+                WHERE table_name = p_ancestors(i);
+
+                IF v_enabled = 'N' OR v_present_dir = C_DIRECTION_DISABLED THEN
+                    insert_compat_report(
+                        p_check_id    => p_check_id,
+                        p_table_name  => p_ancestors(i),
+                        p_column_name => NULL,
+                        p_issue_type  => C_ISSUE_FK_PARENT_DISABLED,
+                        p_severity    => C_SEVERITY_WARNING,
+                        p_detail_a    => 'Parent FK present mais desactive dans SYNC_TABLE_CONFIG : ordre parent -> enfant NON garanti (ORA-02291 possible sur SCHEMA_B).',
+                        p_detail_b    => NULL
+                    );
+                END IF;
+            END IF;
+        END LOOP;
+
+        p_enrolled := v_enrolled;
+    END enroll_fk_lineage;
 
 
     ----------------------------------------------------------------------
@@ -2979,10 +3214,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --      p_sync_mode), puis validation de chaque table demandée (existante et
     --      ACTIVE : ENABLED='Y' et SYNC_DIRECTION != 'DISABLED'), sinon
     --      E_TABLE_NOT_CONFIGURED ;
-    --   2. fermeture transitive des ANCÊTRES FK configurés et actifs
-    --      (expand_fk_ancestors) -> ensemble de run = demandées ∪ parents ;
+    --   2. fermeture transitive COMPLÈTE des ANCÊTRES FK côté SCHEMA_A
+    --      (build_fk_ancestors_raw : demandées ∪ parents, sans filtrage
+    --      config — v4, l'ancien filtre expirait par expand_fk_ancestors) ;
     --   3. en-tête (RUN_TYPE='SYNC_TABLES'), CHECK_COMPATIBILITY sur le
-    --      sous-ensemble (un seul CHECK_ID), filtration des tables BLOCKING ;
+    --      sous-ensemble (un seul CHECK_ID, + enrôlement automatique v4 des
+    --      parents FK absents), filtration des tables BLOCKING ;
     --   4. exécution par grappes (execute_clusters, identique à SYNC_ALL).
     ----------------------------------------------------------------------
     PROCEDURE SYNC_TABLES (
@@ -3030,8 +3267,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             END IF;
         END LOOP;
 
-        -- 2) Résolution implicite des parents FK (ancêtres configurés et actifs).
-        v_run_set := expand_fk_ancestors(v_requested);
+        -- 2) Résolution implicite des parents FK (fermeture brute COMPLÈTE).
+        v_run_set := build_fk_ancestors_raw(v_requested);
 
         INSERT INTO SYNC_RUN_HEADER (run_id, run_type, dry_run, error_mode)
         VALUES (v_run_id, 'SYNC_TABLES', v_dry_run_flag, p_error_mode);
@@ -3039,20 +3276,37 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
         p_run_id := v_run_id;
 
-        -- 3) Compatibilité sur le sous-ensemble (un seul CHECK_ID), puis
-        --    filtration des tables BLOCKING. TOTAL_TABLES = ensemble de run
-        --    (demandées + parents), cohérent avec ce qui est réellement exécuté.
+        -- 3) Compatibilité sur le sous-ensemble (un seul CHECK_ID), avec
+        --    enrôlement automatique v4 (parents FK absents ajoutés à
+        --    SYNC_TABLE_CONFIG), puis filtration des tables BLOCKING.
+        --    TOTAL_TABLES = ensemble de run (demandées + ancêtres), cohérent
+        --    avec ce qui est réellement exécuté.
         v_total := v_run_set.COUNT;
 
-        compat_check_core(v_run_set, v_check_id, v_blocking);
+        compat_check_core(v_run_set, v_check_id, v_blocking, p_enroll_fk => TRUE);
 
+        -- v4 : l'enrôlement automatique de la lignée FK est persisté.
+        COMMIT;
+
+        -- Tables réellement exécutées = ensemble de run, MOINS les tables
+        -- BLOCKING, MOINS les tables PRÉSENTES MAIS DÉSACTIVÉES en config
+        -- (parents FK désactivés : signalés FK_PARENT_DISABLED, jamais
+        -- forcés — le run respecte l'intention de l'administrateur et ne les
+        -- synchronise pas).
         FOR i IN 1 .. v_run_set.COUNT LOOP
-            SELECT COUNT(*) INTO v_block
-            FROM SYNC_COMPATIBILITY_REPORT
-            WHERE check_id = v_check_id AND table_name = v_run_set(i) AND severity = C_SEVERITY_BLOCKING;
+            SELECT COUNT(*) INTO v_exists FROM SYNC_TABLE_CONFIG
+            WHERE table_name = v_run_set(i)
+              AND enabled = 'Y'
+              AND sync_direction != C_DIRECTION_DISABLED;
 
-            IF v_block = 0 THEN
-                v_active(v_active.COUNT + 1) := v_run_set(i);
+            IF v_exists = 1 THEN
+                SELECT COUNT(*) INTO v_block
+                FROM SYNC_COMPATIBILITY_REPORT
+                WHERE check_id = v_check_id AND table_name = v_run_set(i) AND severity = C_SEVERITY_BLOCKING;
+
+                IF v_block = 0 THEN
+                    v_active(v_active.COUNT + 1) := v_run_set(i);
+                END IF;
             END IF;
         END LOOP;
 

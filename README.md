@@ -6,7 +6,7 @@
 
 Architecture générique, bidirectionnelle, idempotente, configurable, auditable et performante de synchronisation de données Oracle entre deux schémas via DB LINK.
 
-**Version 2.0 — Document de spécifications** (correctifs et durcissements v2, cf. [§7](#7-changelog-v2))
+**Version 4.0 — Document de spécifications** (correctifs et durcissements v2, évolutions v3, enrôlement de la lignée FK en v4 — cf. [§7](#7-changelog-v2), [§8](#8-changelog-v3) et [§9](#9-changelog-v4))
 
 ---
 
@@ -20,7 +20,8 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 6. [Annexes](#6-annexes)
 7. [Changelog v2](#7-changelog-v2)
 8. [Changelog v3](#8-changelog-v3)
-9. [Outillage de déploiement et industrialisation](#9-outillage-de-déploiement-et-industrialisation)
+9. [Changelog v4](#9-changelog-v4)
+10. [Outillage de déploiement et industrialisation](#10-outillage-de-déploiement-et-industrialisation)
 
 ---
 
@@ -133,7 +134,7 @@ Avant toute synchronisation, le package compare les métadonnées des tables ent
 - **BLOCKING** : la table est automatiquement exclue du run tant que l'anomalie n'est pas corrigée (ex. table absente d'un côté, type ou longueur incompatible sur une colonne synchronisée, absence de clé exploitable, clé configurée non unique en pratique, clés A/B divergentes).
 - **WARNING** : la table reste synchronisable, l'anomalie est seulement signalée (ex. colonne surnuméraire exclue de fait, nullabilité différente, absence de clé déclarée côté B alors que A en a une).
 
-Typologie des anomalies journalisées (`SYNC_COMPATIBILITY_REPORT.ISSUE_TYPE`) : `MISSING_IN_A`, `MISSING_IN_B`, `TYPE_MISMATCH`, `LENGTH_MISMATCH`, `NULLABLE_MISMATCH`, `PK_MISSING`, `PK_MISMATCH`, `UNSUPPORTED_TYPE`, `KEY_NOT_UNIQUE`, `FK_CYCLE_DEFERRABLE`, `FK_CYCLE_NOT_DEFERRABLE`. Les deux derniers portent sur les cycles FK (cf. [§4.5](#45-ordonnancement-des-écritures-dépendances-fk)) ; `PK_MISMATCH` (correctif v2) compare les clés de correspondance réellement retenues des deux côtés (`WARNING` si B n'a aucune clé détectable, `BLOCKING` si les clés diffèrent).
+Typologie des anomalies journalisées (`SYNC_COMPATIBILITY_REPORT.ISSUE_TYPE`) : `MISSING_IN_A`, `MISSING_IN_B`, `TYPE_MISMATCH`, `LENGTH_MISMATCH`, `NULLABLE_MISMATCH`, `PK_MISSING`, `PK_MISMATCH`, `UNSUPPORTED_TYPE`, `KEY_NOT_UNIQUE`, `FK_CYCLE_DEFERRABLE`, `FK_CYCLE_NOT_DEFERRABLE`, `FK_PARENT_ENROLLED`, `FK_PARENT_DISABLED`. Les deux `FK_CYCLE_*` portent sur les cycles FK (cf. [§4.5](#45-ordonnancement-des-écritures-dépendances-fk)) ; `PK_MISMATCH` (correctif v2) compare les clés de correspondance réellement retenues des deux côtés (`WARNING` si B n'a aucune clé détectable, `BLOCKING` si les clés diffèrent). Les deux `FK_PARENT_*` (v4) portent sur la lignée FK hors périmètre configuré (cf. [§3.9](#39-périmètre-par-liste-de-tables-et-expansion-implicite-des-dépendances-fk)) : `FK_PARENT_ENROLLED` signale un parent FK absent de `SYNC_TABLE_CONFIG` **enrôlé automatiquement** avec sa lignée (`WARNING`) ; `FK_PARENT_DISABLED` signale un parent présent mais désactivé (`ENABLED='N'` ou `SYNC_DIRECTION='DISABLED'`), **jamais forcé** (`WARNING`).
 
 ### 3.6. Mode simulation (DRY_RUN)
 
@@ -164,16 +165,17 @@ La sentinelle `C_SYNC_MODE_KEEP_CURRENT` (valeur par défaut) signifie « utilis
 
 ### 3.9. Périmètre par liste de tables et expansion implicite des dépendances FK
 
-`SYNC_TABLES` prend une **liste** de tables logiques (`t_tab_name_list`) et applique la **résolution implicite des dépendances FK** : la fermeture transitive des **tables parentes** (ancêtres FK) configurées et actives est automatiquement ajoutée au périmètre. L'objectif est d'éviter les incohérences référentielles lorsqu'un appelant cible une table enfant sans citer ses parents.
+`SYNC_TABLES` prend une **liste** de tables logiques (`t_tab_name_list`) et applique la **résolution implicite des dépendances FK** : la fermeture transitive des **tables parentes** (ancêtres FK) est automatiquement ajoutée au périmètre. Depuis la v4, cette résolution est couplée à un **enrôlement automatique de la lignée** : tout parent FK absent de `SYNC_TABLE_CONFIG` est ajouté (et son propre parent récursivement), pour garantir l'ordre parent → enfant et éviter les `ORA-02291` côté `SCHEMA_B`.
 
-Règles :
+Règles (v4) :
 
 - Chaque table demandée doit exister en configuration et être active (`ENABLED='Y'`, `SYNC_DIRECTION != 'DISABLED'`), sinon `E_TABLE_NOT_CONFIGURED` (`-20002`).
 - Seuls les **parents** sont ajoutés (jamais les enfants ni les tables sans lien).
-- Seuls les parents **configurés et actifs** sont retenus ; un parent non configuré est simplement ignoré (il n'a pas à être synchronisé).
-- L'ensemble résolu est exécuté par grappes, dans l'ordre topologique (parents avant enfants), exactement comme `SYNC_ALL`.
+- Un parent **absent** de `SYNC_TABLE_CONFIG` est **enrôlé automatiquement** : profil `AUTO_FK_LINEAGE` (`ENABLED='Y'`, `SYNC_DELETE='N'`, `SYNC_MODE='INSERT_UPDATE'`, `CONFLICT_STRATEGY='ERROR_ON_CONFLICT'`, `PRIORITY=100`, `UPDATED_BY='AUTO_FK_LINEAGE'`), avec `SYNC_DIRECTION` **héritée de l'enfant** (repli `BIDIRECTIONAL` si sens multiples/absents), WARNING `FK_PARENT_ENROLLED` rattaché au `CHECK_ID` courant. L'enrôlement est **persisté** (`COMMIT`) et **idempotent** (jamais dupliqué).
+- Un parent **présent mais désactivé** (`ENABLED='N'` ou `SYNC_DIRECTION='DISABLED'`) n'est **jamais forcé** : WARNING `FK_PARENT_DISABLED`, la table reste respectable mais n'est **pas exécutée** par le run.
+- L'ensemble résolu (demandées + parents enrôlés/y compris les parents désactivés en signalement) est exécuté par grappes, dans l'ordre topologique (parents avant enfants), exactement comme `SYNC_ALL` ; TOTAL_TABLES englobe la fermeture, TABLES_EXCLUDED comptabilise bloqueurs et parents désactivés non exécutés.
 
-> **Différence avec `SYNC_TABLE`** — `SYNC_TABLE` ne traite que la table demandée (rattrapage ciblé). `SYNC_TABLES` étend ce périmètre aux parents FK nécessaires à la cohérence, tout en restant plus restreint qu'un `SYNC_ALL` complet.
+> **Différence avec `SYNC_TABLE`** — `SYNC_TABLE` ne traite que la table demandée (rattrapage ciblé) et **ne mute jamais** la configuration (pas d'enrôlement). `SYNC_TABLES` étend ce périmètre aux parents FK nécessaires à la cohérence, tout en restant plus restreint qu'un `SYNC_ALL` complet. `CHECK_COMPATIBILITY(NULL)` applique le même enrôlement (et le persiste) en contrôle autonome ; les surcharges mono-table et liste restent non mutantes.
 
 ---
 
@@ -407,7 +409,7 @@ Ce document de spécifications accompagne les livrables techniques suivants, pro
 - **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL, non destructif)
 - **Script 8** — Migration v1 → v2/v3 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT, `SYNC_MODE` / `RUN_TYPE`)
 - **Script 9** — Démonstration des modes de synchronisation (`INSERT`, `UPDATE`, `INSERT_UPDATE` et mode par table), avec remise à l'état initial (optionnel)
-- **Outillage** — `setup_project.py` + package `tools/orasync` (déploiement, tests et diagnostic en ligne de commande, cf. [§9](#9-outillage-de-déploiement-et-industrialisation))
+- **Outillage** — `setup_project.py` + package `tools/orasync` (déploiement, tests et diagnostic en ligne de commande, cf. [§10](#10-outillage-de-déploiement-et-industrialisation))
 
 ---
 
@@ -438,7 +440,20 @@ Récapitulatif des correctifs et durcissements apportés en v2 par rapport au do
 
 ---
 
-## 9. Outillage de déploiement et industrialisation
+## 9. Changelog v4
+
+Évolutions fonctionnelles apportées en v4 :
+
+- **Enrôlement automatique de la lignée FK** : nouvelle procédure privée `enroll_fk_lineage` + fermeture basse du dictionnaire `build_fk_ancestors_raw`. Tout parent FK (fermeture transitive côté `SCHEMA_A`) absent de `SYNC_TABLE_CONFIG` est **enrôlé automatiquement** (profil `AUTO_FK_LINEAGE`, direction **héritée de l'enfant**, WARNING `FK_PARENT_ENROLLED`) lors de `CHECK_COMPATIBILITY(NULL)` (contrôle autonome), `SYNC_ALL` et `SYNC_TABLES`. L'enrôlement est persisté (`COMMIT`) et idempotent.
+- **Parents désactivés jamais forcés** : un parent présent mais `ENABLED='N'` / `SYNC_DIRECTION='DISABLED'` est signalé en WARNING (`FK_PARENT_DISABLED`) sans être activé, et **exclu du périmètre exécuté** (il n'est plus injecté dans le run, contrairement aux ancêtres actifs).
+- **Périmètre de validation élargi** : le contrôle de compatibilité porte désormais sur la **fermeture complète** (seeds ∪ ancêtres) au sein d'un unique `CHECK_ID` ; chaque parent nouvellement enrôlé est structurellement validé dans le même contrôle.
+- **`SYNC_TABLE` inchangé** : le rattrapage mono-table ne mute pas `SYNC_TABLE_CONFIG` (ni la surcharge `CHECK_COMPATIBILITY` mono-table / liste).
+- **Migration** : Script 8 étendu (toujours idempotent) — `CK_SCR_ISSUE_TYPE` accepte `FK_PARENT_ENROLLED` et `FK_PARENT_DISABLED` ; le Script 2 (installation neuve) est aligné sur le même périmètre.
+- **Tests** : harnais Script 7 enrichi d'un Bloc 9 (9 sections) — scénario auto-réparant : `SYNC_TABLE` non mutant, enrôlement + direction héritée, profil `AUTO_FK_LINEAGE`, `FK_PARENT_DISABLED` sans forçage, idempotence d'un second contrôle, run `SYNC_TABLES` post-enrôlement sans `FAILED`. Validation attendue : run réel `SYNC_TABLES` post-enrôlement en ordre topologique garantissant l'absence d'`ORA-02291`.
+
+---
+
+## 10. Outillage de déploiement et industrialisation
 
 Le projet fournit un outillage Python autonome qui remplace le client `sqlplus` pour le déploiement et les tests : création de l'environnement virtuel, installation des dépendances, exécution des scripts SQL\*Plus, contrôle des connexions et diagnostic.
 

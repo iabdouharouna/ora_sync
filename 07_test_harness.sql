@@ -441,6 +441,172 @@ END;
 /
 
 --------------------------------------------------------------------------------
+-- Bloc 9 : (v4) enrôlement automatique de la lignée FK
+--
+-- Scénario temporaire, auto-réparant (état restauré en fin de bloc) :
+--   * suppression de la configuration de COMMANDE  -> parent FK ABSENT de
+--     COMMANDE_LIGNE, à ré-enrôler automatiquement ;
+--   * désactivation de PRODUIT                     -> parent FK PRÉSENT MAIS
+--     DÉSACTIVÉ, à signaler (WARNING) sans jamais être forcé ;
+--   * COMMANDE_LIGNE passé en mode A_TO_B          -> la direction du parent
+--     enrôlé doit en être HÉRITÉE.
+--
+-- Points validés : SYNC_TABLE (mono) ne mute pas la config ; l'enrôlement
+-- rattache FK_PARENT_ENROLLED au CHECK_ID courant ; priorité/direction du
+-- profil AUTO_FK_LINEAGE ; FK_PARENT_DISABLED sans forçage ; idempotence
+-- d'un second contrôle ; un run SYNC_TABLES dry post-enrôlement passe sans
+-- FAILED ni ORA-02291 (ordre parent -> enfant garanti).
+--------------------------------------------------------------------------------
+DECLARE
+    v_cmd_cfg      SYNC_TABLE_CONFIG%ROWTYPE;
+    v_prod_enabled CHAR(1);
+    v_prod_now     CHAR(1);
+    v_clig_dir     VARCHAR2(20);
+    v_check_id1    NUMBER;
+    v_check_id2    NUMBER;
+    v_blocking     BOOLEAN;
+    v_cnt          NUMBER;
+    v_cnt_enr      NUMBER;
+    v_run_id       NUMBER;
+    v_status       VARCHAR2(30);
+    v_dir          VARCHAR2(20);
+    v_prio         NUMBER;
+    PROCEDURE restore_state IS
+    BEGIN
+        DELETE FROM SYNC_TABLE_CONFIG
+        WHERE table_name = 'COMMANDE' AND NVL(updated_by, ' ') = 'AUTO_FK_LINEAGE';
+
+        INSERT INTO SYNC_TABLE_CONFIG (
+            TABLE_NAME, ENABLED, SYNC_DELETE, SYNC_DIRECTION, SYNC_MODE,
+            CONFLICT_STRATEGY, PRIORITY, UPDATED_BY
+        ) VALUES (
+            v_cmd_cfg.table_name, v_cmd_cfg.enabled, v_cmd_cfg.sync_delete,
+            v_cmd_cfg.sync_direction, v_cmd_cfg.sync_mode,
+            v_cmd_cfg.conflict_strategy, v_cmd_cfg.priority, v_cmd_cfg.updated_by
+        );
+
+        UPDATE SYNC_TABLE_CONFIG SET enabled = v_prod_enabled WHERE table_name = 'PRODUIT';
+        UPDATE SYNC_TABLE_CONFIG SET sync_direction = v_clig_dir WHERE table_name = 'COMMANDE_LIGNE';
+        COMMIT;
+    END restore_state;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('== Bloc 9 : (v4) enrollement automatique de la lignee FK ==');
+
+    ------------------------------------------------------------
+    -- 1) Sauvegarde de l'état config, puis mise en place du scénario.
+    ------------------------------------------------------------
+    SELECT * INTO v_cmd_cfg FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE';
+    -- structure identique attendue des deux côtés : inutile d'auditionner
+    SELECT enabled INTO v_prod_enabled FROM SYNC_TABLE_CONFIG WHERE table_name = 'PRODUIT';
+    SELECT sync_direction INTO v_clig_dir FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE_LIGNE';
+
+    DELETE FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE';
+    UPDATE SYNC_TABLE_CONFIG SET enabled = 'N' WHERE table_name = 'PRODUIT';
+    UPDATE SYNC_TABLE_CONFIG SET sync_direction = 'A_TO_B' WHERE table_name = 'COMMANDE_LIGNE';
+    COMMIT;
+
+    BEGIN
+        ----------------------------------------------------
+        -- 2) SYNC_TABLE (mono) ne doit PAS muter la configuration.
+        ----------------------------------------------------
+        PKG_SCHEMA_SYNC.SYNC_TABLE('COMMANDE_LIGNE', p_dry_run => TRUE, p_run_id => v_run_id);
+        T_HARNESS.ASSERT_TRUE('SYNC_TABLE dry execute sans erreur', v_run_id IS NOT NULL);
+
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE';
+        T_HARNESS.ASSERT_TRUE('SYNC_TABLE ne re-enrole pas le parent absent',
+            v_cnt = 0, 'nb_config_COMMANDE=' || v_cnt);
+
+        ----------------------------------------------------
+        -- 3) CHECK_COMPATIBILITY(NULL) : enrôlement du parent absent.
+        ----------------------------------------------------
+        PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => NULL, p_check_id => v_check_id1,
+            p_has_blocking_issues => v_blocking);
+        T_HARNESS.ASSERT_TRUE('CHECK_COMPATIBILITY(NULL) execute sans erreur', v_check_id1 IS NOT NULL);
+
+        SELECT COUNT(*) INTO v_cnt_enr FROM SYNC_COMPATIBILITY_REPORT
+        WHERE check_id = v_check_id1 AND table_name = 'COMMANDE' AND issue_type = 'FK_PARENT_ENROLLED'
+          AND severity = 'WARNING';
+        T_HARNESS.ASSERT_TRUE('FK_PARENT_ENROLLED emis (WARNING) pour COMMANDE',
+            v_cnt_enr = 1, 'nb=' || v_cnt_enr);
+
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE';
+        T_HARNESS.ASSERT_TRUE('COMMANDE re-enrolee automatiquement dans SYNC_TABLE_CONFIG',
+            v_cnt = 1, 'nb=' || v_cnt);
+
+        SELECT sync_direction, priority, enabled
+        INTO v_dir, v_prio, v_cmd_cfg.enabled
+        FROM SYNC_TABLE_CONFIG WHERE table_name = 'COMMANDE';
+        T_HARNESS.ASSERT_TRUE('Direction du parent enrolee = A_TO_B (heritee de COMMANDE_LIGNE)',
+            v_dir = 'A_TO_B', 'dir=' || v_dir);
+        T_HARNESS.ASSERT_TRUE('Profil AUTO_FK_LINEAGE : PRIORITY=100',
+            v_prio = 100, 'prio=' || v_prio);
+        T_HARNESS.ASSERT_TRUE('Profil AUTO_FK_LINEAGE : ENABLED=Y', v_cmd_cfg.enabled = 'Y',
+            'enabled=' || v_cmd_cfg.enabled);
+
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_TABLE_CONFIG
+        WHERE table_name = 'COMMANDE' AND updated_by = 'AUTO_FK_LINEAGE';
+        T_HARNESS.ASSERT_TRUE('updated_by = AUTO_FK_LINEAGE (traillabilite)',
+            v_cnt = 1, 'nb=' || v_cnt);
+
+        ----------------------------------------------------
+        -- 4) Parent PRÉSENT mais DÉSACTIVÉ : WARNING, jamais forcé.
+        ----------------------------------------------------
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_COMPATIBILITY_REPORT
+        WHERE check_id = v_check_id1 AND table_name = 'PRODUIT' AND issue_type = 'FK_PARENT_DISABLED'
+          AND severity = 'WARNING';
+        T_HARNESS.ASSERT_TRUE('FK_PARENT_DISABLED emis (WARNING) pour PRODUIT',
+            v_cnt = 1, 'nb=' || v_cnt);
+
+        SELECT enabled INTO v_prod_now FROM SYNC_TABLE_CONFIG WHERE table_name = 'PRODUIT';
+        T_HARNESS.ASSERT_TRUE('PRODUIT non force (reste desactive)',
+            v_prod_now = 'N', 'enabled=' || v_prod_now);
+
+        ----------------------------------------------------
+        -- 5) Idempotence : un second contrôle n'enrôle plus rien.
+        ----------------------------------------------------
+        PKG_SCHEMA_SYNC.CHECK_COMPATIBILITY(p_table_name => NULL, p_check_id => v_check_id2,
+            p_has_blocking_issues => v_blocking);
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_COMPATIBILITY_REPORT
+        WHERE check_id = v_check_id2 AND table_name = 'COMMANDE' AND issue_type = 'FK_PARENT_ENROLLED';
+        T_HARNESS.ASSERT_TRUE('Second controle : aucun re-enrolement (idempotent)',
+            v_cnt = 0, 'nb=' || v_cnt);
+
+        ----------------------------------------------------
+        -- 6) Run SYNC_TABLES post-enrôlement : tout passe, order garanti.
+        ----------------------------------------------------
+        PKG_SCHEMA_SYNC.SYNC_TABLES(
+            p_table_list => PKG_SCHEMA_SYNC.t_tab_name_list('COMMANDE_LIGNE'),
+            p_dry_run    => TRUE,
+            p_run_id     => v_run_id
+        );
+        SELECT status INTO v_status FROM SYNC_RUN_HEADER WHERE run_id = v_run_id;
+        T_HARNESS.ASSERT_TRUE('SYNC_TABLES post-enrolement : statut coherent',
+            v_status IN ('SUCCESS','SUCCESS_WITH_CONFLICTS','PARTIAL'), 'status=' || v_status);
+
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_LOG
+        WHERE run_id = v_run_id AND status = 'FAILED';
+        T_HARNESS.ASSERT_TRUE('Aucune table en FAILED sur le run dry (pas d''ORA-02291)',
+            v_cnt = 0, 'nb_failed=' || v_cnt);
+
+        ----------------------------------------------------
+        -- 7) Restauration de l'état config initial.
+        ----------------------------------------------------
+        restore_state;
+        T_HARNESS.RESULT('fk_lineage_v4');
+    EXCEPTION
+        WHEN OTHERS THEN
+            BEGIN
+                restore_state;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_OUTPUT.PUT_LINE('  RESTORE partiel impossible : ' || SQLERRM);
+            END;
+            RAISE;
+    END;
+END;
+/
+
+--------------------------------------------------------------------------------
 -- Chaque section a déjà émis son propre bilan (RESULT), qui lève une erreur
 -- si la section a échoué. sqlplus n'interrompant pas le script sur erreur par
 -- défaut, les sections suivantes s'exécutent quand même : la sortie complète

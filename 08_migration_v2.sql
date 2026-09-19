@@ -7,9 +7,12 @@
 --
 -- Ressources modifiées :
 --   1. Contrainte CK_SCR_ISSUE_TYPE  -> ajout de FK_CYCLE_DEFERRABLE et
---                                       FK_CYCLE_NOT_DEFERRABLE
+--                                       FK_CYCLE_NOT_DEFERRABLE, puis (v4)
+--                                       FK_PARENT_ENROLLED et
+--                                       FK_PARENT_DISABLED
 --      (indispensable : le body v1 écrivait déjà 'FK_CYCLE_NOT_DEFERRABLE'
---       alors que la contrainte installée ne l'acceptait pas -> ORA-02290).
+--       alors que la contrainte installée ne l'acceptait pas -> ORA-02290 ;
+--       la v4 écrit en plus les deux ISSUE_TYPE d'enrôlement automatique).
 --   2. SYNC_CONFLICT.PK_HASH_KEY      -> VARCHAR2(64)  (clé désormais hashée)
 --      ATTENTION : les enregistrements historiques créés par la v1 portent
 --      l'ANCIENNE représentation (concaténation brute, potentiellement > 64).
@@ -50,10 +53,11 @@ ALTER TABLE SYNC_COMPATIBILITY_REPORT
     ADD CONSTRAINT CK_SCR_ISSUE_TYPE CHECK (ISSUE_TYPE IN (
         'MISSING_IN_A','MISSING_IN_B','TYPE_MISMATCH','LENGTH_MISMATCH',
         'NULLABLE_MISMATCH','PK_MISSING','PK_MISMATCH','UNSUPPORTED_TYPE',
-        'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE'
+        'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE',
+        'FK_PARENT_ENROLLED','FK_PARENT_DISABLED'
     ));
 
-PROMPT => 1. CK_SCR_ISSUE_TYPE mise a jour (perimetre v2).
+PROMPT => 1. CK_SCR_ISSUE_TYPE mise a jour (perimetre v4 : FK_PARENT_ENROLLED/FK_PARENT_DISABLED).
 
 
 --------------------------------------------------------------------------------

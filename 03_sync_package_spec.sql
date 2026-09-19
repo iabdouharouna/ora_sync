@@ -131,6 +131,15 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     C_ISSUE_FK_CYCLE_DEFERRABLE     CONSTANT VARCHAR2(30) := 'FK_CYCLE_DEFERRABLE';
     C_ISSUE_FK_CYCLE_NOT_DEFERRABLE CONSTANT VARCHAR2(30) := 'FK_CYCLE_NOT_DEFERRABLE';
 
+    -- Types d'anomalie liés à la lignée FK hors périmètre configuré (v4) :
+    -- FK_PARENT_ENROLLED : parent FK absent de SYNC_TABLE_CONFIG, enrôlé
+    --                      automatiquement avec la lignée de ses ancêtres (WARNING)
+    -- FK_PARENT_DISABLED : parent FK présent mais désactivé (ENABLED='N' ou
+    --                      SYNC_DIRECTION='DISABLED'). Jamais forcé : l'ordre
+    --                      parent -> enfant n'est pas garanti (WARNING)
+    C_ISSUE_FK_PARENT_ENROLLED      CONSTANT VARCHAR2(30) := 'FK_PARENT_ENROLLED';
+    C_ISSUE_FK_PARENT_DISABLED      CONSTANT VARCHAR2(30) := 'FK_PARENT_DISABLED';
+
 
     --------------------------------------------------------------------------
     -- EXCEPTIONS PUBLIQUES
@@ -309,10 +318,12 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- Synchronise une LISTE de tables (type public t_tab_name_list), avec
     -- RÉSOLUTION IMPLICITE DES DÉPENDANCES FK : l'ensemble exécuté = tables
     -- demandées ∪ fermeture transitive de leurs tables PARENTES (ancêtres
-    -- via les contraintes FK de SCHEMA_A) configurées et actives
-    -- (ENABLED='Y' et SYNC_DIRECTION != 'DISABLED'). Les parents hors
-    -- configuration (ou désactivés) ne sont PAS ajoutés — ils restent hors
-    -- périmètre (signalé dans le rapport de compatibilité le cas échéant).
+    -- via les contraintes FK de SCHEMA_A). Depuis la v4, les parents ABSENTS
+    -- de SYNC_TABLE_CONFIG sont enrôlés AUTOMATIQUEMENT (enrôlement de la
+    -- lignée complète, cf. CHECK_COMPATIBILITY) ; les parents PRÉSENTS MAIS
+    -- DÉSACTIVÉS (ENABLED='N' ou SYNC_DIRECTION='DISABLED') ne sont jamais
+    -- forcés : signalés WARNING (FK_PARENT_DISABLED), ils restent hors du
+    -- périmètre exécuté.
     --
     -- Pourquoi : éviter ORA-02291 ("parent key not found") lors des
     -- insertions — insérer un enfant sans avoir synchronisé son parent peut
@@ -368,6 +379,15 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --
     -- p_db_link : cf. SYNC_ALL — optionnel, override ponctuel équivalent à
     -- SET_DB_LINK(p_db_link) avant ce contrôle.
+    --
+    -- v4 (surcharge p_table_name = NULL uniquement) : le contrôle enrôle
+    -- automatiquement la LIGNÉE FK des tables actives — fermeture transitive
+    -- côté SCHEMA_A — puis valide chaque ancêtre dans le MÊME CHECK_ID et
+    -- PERSISTE l'enrôlement (COMMIT). Les parents absents sont ajoutés à
+    -- SYNC_TABLE_CONFIG (profil AUTO_FK_LINEAGE, direction héritée de
+    -- l'enfant, WARNING FK_PARENT_ENROLLED) ; les parents présents mais
+    -- désactivés sont signalés sans forçage (WARNING FK_PARENT_DISABLED).
+    -- Les surcharges mono-table et LISTE restent NON mutantes.
     ----------------------------------------------------------------------
     PROCEDURE CHECK_COMPATIBILITY (
         p_table_name            IN  VARCHAR2 DEFAULT NULL,
