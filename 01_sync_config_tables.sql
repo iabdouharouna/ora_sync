@@ -194,6 +194,60 @@ COMMENT ON TABLE SYNC_KEY_CONFIG IS
 
 
 --------------------------------------------------------------------------------
+-- 4. SYNC_RUN_OPTION (v5)
+--
+-- Rôle    : options GLOBALES de comportement du run, à ce point qu'il ne
+--           s'agit ni de configuration par table (SYNC_TABLE_CONFIG) ni de
+--           paramètre d'appel ponctuel. Chaque option est un couple
+--           (OPTION_NAME, OPTION_VALUE) en clé/valeur.
+--
+-- Options (défaut entre parenthèses) :
+--   AUTO_BACKFILL_PARENTS ('Y')   : si un INSERT enfant échoue sur ORA-02291
+--                                   (parent absent de SCHEMA_B), le parent est
+--                                   recherché dans SCHEMA_A et ré-inséré dans B
+--                                   (récursivement), puis l'enfant est réessayé
+--                                   (livrable 1).
+--   MAX_FK_RETRY ('3')            : nombre maximal de tentatives (backfill +
+--                                   nouvel INSERT) pour une table en ORA-02291.
+--   CYCLE_HANDLING ('DISABLE_FK') : traitement d'un cycle FK non déferrable :
+--                                   'DISABLE_FK' = désactivation temporaire des
+--                                   FK du cycle côté SCHEMA_B (nécessite les
+--                                   privilèges ALTER ANY TABLE sur B), 'BLOCK' =
+--                                   comportement historique (exclusion + BLOCKING).
+--   AUTO_CREATE_MISSING_TABLE ('N'): si 'Y', une table active absente de
+--                                   SCHEMA_B est créée automatiquement (DDL
+--                                   depuis les métadonnées de SCHEMA_A) au lieu
+--                                   de lever MISSING_IN_B bloquant.
+--
+-- Les valeurs sont en VARCHAR2 : les booléens utilisent 'Y'/'N'. API dédiée :
+-- PKG_SCHEMA_SYNC.SET_RUN_OPTION / GET_RUN_OPTION.
+--------------------------------------------------------------------------------
+CREATE TABLE SYNC_RUN_OPTION (
+    OPTION_NAME     VARCHAR2(64)    NOT NULL,
+    OPTION_VALUE    VARCHAR2(256),
+
+    UPDATED_DATE    TIMESTAMP       DEFAULT SYSTIMESTAMP NOT NULL,
+    UPDATED_BY      VARCHAR2(128)   DEFAULT USER NOT NULL,
+
+    CONSTRAINT PK_SYNC_RUN_OPTION PRIMARY KEY (OPTION_NAME),
+
+    CONSTRAINT CK_SRO_NAME
+        CHECK (OPTION_NAME IN (
+            'AUTO_BACKFILL_PARENTS','MAX_FK_RETRY',
+            'CYCLE_HANDLING','AUTO_CREATE_MISSING_TABLE'
+        ))
+);
+
+COMMENT ON TABLE SYNC_RUN_OPTION IS
+    'Options globales de comportement du run (auto-reparation FK, cycles, auto-creation).';
+
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('AUTO_BACKFILL_PARENTS', 'Y', 'SYNC_ADMIN');
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('MAX_FK_RETRY',          '3', 'SYNC_ADMIN');
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('CYCLE_HANDLING',        'DISABLE_FK', 'SYNC_ADMIN');
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('AUTO_CREATE_MISSING_TABLE', 'N', 'SYNC_ADMIN');
+
+
+--------------------------------------------------------------------------------
 -- Séquence technique pour l'identifiant de run (utilisée par SYNC_LOG,
 -- créée ici plutôt que dans le Script 2 pour que la configuration soit
 -- livrée en un bloc autonome et testable indépendamment du reste).

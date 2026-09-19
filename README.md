@@ -21,7 +21,8 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 7. [Changelog v2](#7-changelog-v2)
 8. [Changelog v3](#8-changelog-v3)
 9. [Changelog v4](#9-changelog-v4)
-10. [Outillage de déploiement et industrialisation](#10-outillage-de-déploiement-et-industrialisation)
+10. [Changelog v5](#10-changelog-v5)
+11. [Outillage de déploiement et industrialisation](#11-outillage-de-déploiement-et-industrialisation)
 
 ---
 
@@ -409,7 +410,9 @@ Ce document de spécifications accompagne les livrables techniques suivants, pro
 - **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL, non destructif)
 - **Script 8** — Migration v1 → v2/v3 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT, `SYNC_MODE` / `RUN_TYPE`)
 - **Script 9** — Démonstration des modes de synchronisation (`INSERT`, `UPDATE`, `INSERT_UPDATE` et mode par table), avec remise à l'état initial (optionnel)
-- **Outillage** — `setup_project.py` + package `tools/orasync` (déploiement, tests et diagnostic en ligne de commande, cf. [§10](#10-outillage-de-déploiement-et-industrialisation))
+- **Script 10** — Migration v4 → v5 (idempotente : auto-réparation des FK parents absents / cycles / auto-création de tables manquantes, table `SYNC_RUN_OPTION`, `CHECK` de `SYNC_COMPATIBILITY_REPORT` élargi)
+- **Prérequis SYS (une fois)** — `09_sys_auto_repair_grants.sql` : octroi idempotent, avec le profil `sys`, des privilèges système nécessaires à l'auto-réparation v5 (ALTER / CREATE ANY TABLE / INDEX, INSERT / UPDATE / DELETE ANY TABLE) — à exécuter **avant** le Script 8/10 côté `admin` (cf. [§11.3](#113-commandes))
+- **Outillage** — `setup_project.py` + package `tools/orasync` (déploiement, tests et diagnostic en ligne de commande, cf. [§11](#11-outillage-de-déploiement-et-industrialisation))
 
 ---
 
@@ -453,11 +456,27 @@ Récapitulatif des correctifs et durcissements apportés en v2 par rapport au do
 
 ---
 
-## 10. Outillage de déploiement et industrialisation
+## 10. Changelog v5
+
+Enrichissements fonctionnels apportés en v5 (auto-réparation ascendante) :
+
+- **Auto-réparation des parents FK absents** — nouvelle fonctionnalité : les parents FK absents (clôture transitive côté `SCHEMA_A`) sont **créés/réparés automatiquement** (profil `AUTO_FK_REPAIR`, direction **héritée de l'enfant**, statut `FK_PARENT_REPAIRED`) — idempotent, persistant (`COMMIT`) sans muter `SYNC_TABLE_CONFIG`.
+- **Auto-réparation des cycles FK** — les cycles (parents absents en cycle) sont détectés et traités sans échec (`FK_CYCLE_REPAIRED` / `CYCLE_BROKEN`), avec désactivation temporaire idempotente du FK de cycle côté `B`.
+- **Auto-création de tables manquantes** — les tables de `B` absentes structurellement (périmètre par liste / `SYNC_TABLES`) sont **créées automatiquement** (profil `AUTO_TABLE_CREATION`, statut `TABLE_CREATED_IN_B`) sans modification de `SYNC_TABLE_CONFIG`.
+- **`SYNC_RUN_OPTION`** — nouvelle table de configuration des options globales de run (`AUTO_FK_REPAIR`, `CYCLE_HANDLING`, `AUTO_TABLE_CREATION`), créée par le Script 10 (idempotent).
+- **`CHECK` de `SYNC_COMPATIBILITY_REPORT` élargi** — le `CHECK` de `SYNC_COMPATIBILITY_REPORT` accepte les statuts v5 (`FK_PARENT_REPAIRED`, `FK_CYCLE_REPAIRED`, `TABLE_CREATED_IN_B`) — Script 10 idempotent, aligné sur le Script 2 (installation neuve).
+- **Prérequis SYS (une fois)** — `09_sys_auto_repair_grants.sql` octroie, avec le profil `sys` (SYSDBA), les privilèges nécessaires à l'auto-réparation v5 (`ALTER / CREATE ANY TABLE / INDEX`, `INSERT / UPDATE / DELETE ANY TABLE`) — à exécuter avant le Script 8/10 côté `admin` (cf. [§11.3](#113-commandes)).
+- **Tests** — harnais Script 7 étendu d'un Bloc 10 (10 sections) : scénario auto-réparant — `SYNC_TABLE` non mutant, enrôlement + direction héritée, profil `AUTO_FK_REPAIR`, `FK_PARENT_DISABLED` sans forçage, idempotence d'un second contrôle, run `SYNC_TABLES` post-réparation sans `FAILED`. Validation attendue : run réel `SYNC_TABLES` post-auto-réparation en ordre topologique garantissant l'absence d'`ORA-02291`.
+
+---
+
+---
+
+## 11. Outillage de déploiement et industrialisation
 
 Le projet fournit un outillage Python autonome qui remplace le client `sqlplus` pour le déploiement et les tests : création de l'environnement virtuel, installation des dépendances, exécution des scripts SQL\*Plus, contrôle des connexions et diagnostic.
 
-### 9.1. Fichiers
+### 11.1. Fichiers
 
 | Chemin | Rôle |
 |--------|------|
@@ -466,7 +485,7 @@ Le projet fournit un outillage Python autonome qui remplace le client `sqlplus` 
 | `requirements.txt` | Dépendances Python (`oracledb`) |
 | `.env.example` | Modèle de configuration des connexions (à copier en `.env`) |
 
-### 9.2. Démarrage rapide
+### 11.2. Démarrage rapide
 
 ```bash
 cp .env.example .env          # renseigner les mots de passe
@@ -476,13 +495,13 @@ python3 setup_project.py setup --with-sample --run-tests
 
 Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automatiquement dans l'environnement virtuel. Aucune installation manuelle n'est requise.
 
-### 9.3. Commandes
+### 11.3. Commandes
 
 | Commande | Rôle | Profil(s) utilisé(s) |
 |----------|------|----------------------|
 | `check` | Teste chaque connexion et affiche version/utilisateur | tous |
-| `install [--no-migrate]` | Crée les tables et le package (Scripts 1→4 puis 8) | `admin` |
-| `migrate` | Applique la migration idempotente (Script 8) | `admin` |
+| `install [--no-migrate]` | Crée les tables et le package (Scripts 1→4 puis 8 et 10 idempotents) | `admin` |
+| `migrate` | Applique les migrations idempotentes (Scripts 8 et 10) | `admin` |
 | `sample [--link-user X]` | Charge données et configuration d'exemple (Script 5, sections A/B/CONFIG) | `schema_a`, `schema_b`, `admin` |
 | `test` | Exécute le harnais de validation (Script 7) | `admin` |
 | `setup [--with-sample] [--run-tests]` | Enchaîne `install` [+ `sample`] [+ `test`] | selon étape |
@@ -491,7 +510,7 @@ Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automati
 
 Options globales : `--env-file`, `-v`/`-vv` (verbosité), `--dry-run` (affiche les actions sans exécuter les scripts).
 
-### 9.4. Configuration par variables d'environnement
+### 11.4. Configuration par variables d'environnement
 
 Les connexions sont décrites par des variables préfixées `ORASYNC_`, chargées depuis `.env` (sans écraser l'environnement du shell) :
 
@@ -503,7 +522,7 @@ Les connexions sont décrites par des variables préfixées `ORASYNC_`, chargée
 | `ORASYNC_LINK_NAME` / `ORASYNC_LINK_USER` | Lien de base de données et utilisateur pour la section B du Script 5 |
 | `ORASYNC_VENV`, `ORASYNC_ENV_FILE`, `ORASYNC_SCRIPTS_DIR`, `ORASYNC_LOG_FILE` | Options de l'outillage |
 
-### 9.5. Comportement et garanties
+### 11.5. Comportement et garanties
 
 - **Sémantique SQL\*Plus fidèle** : les commandes (`SET`, `PROMPT`, `COLUMN`, `SHOW`, `@`, `EXEC`…) ne sont reconnues que hors tampon de requête ; les blocs PL/SQL sont terminés par `/`, les instructions SQL par `;` ; `DBMS_OUTPUT` est restitué et les erreurs de compilation sont lues dans `USER_ERRORS`.
 - **Installation tolérante** : `install`, `migrate` et `sample` ignorent les erreurs DDL d'idempotence (`ORA-00955`, `ORA-00942`, `ORA-14452`, …) et n'échouent que sur une erreur inattendue. En particulier, la recréation des GTT peut être ignorée si une session tierce (ex. SQL Developer) les utilise — `ORA-14452`.

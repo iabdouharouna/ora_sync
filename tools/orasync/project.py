@@ -32,8 +32,9 @@ CORE_SCRIPTS: tuple[ScriptSpec, ...] = (
     ScriptSpec("04_sync_package_body.sql", "admin", "Corps du package"),
 )
 
-MIGRATION_SCRIPT = ScriptSpec(
-    "08_migration_v2.sql", "admin", "Migration idempotente v1 -> v2/v3"
+MIGRATION_SCRIPTS = (
+    ScriptSpec("08_migration_v2.sql", "admin", "Migration idempotente v1 -> v2/v3"),
+    ScriptSpec("10_migration_v5.sql", "admin", "Migration idempotente v5 (auto-reparation FK/cycles/auto-creation)"),
 )
 SAMPLE_SCRIPT = ScriptSpec(
     "05_sample_data_and_config.sql", "multi", "Donnees et configuration d'exemple"
@@ -114,7 +115,7 @@ def install_core(
 ) -> RunStats:
     scripts: list[ScriptSpec] = list(CORE_SCRIPTS)
     if with_migration:
-        scripts.append(MIGRATION_SCRIPT)
+        scripts.extend(MIGRATION_SCRIPTS)
     return run_scripts(
         settings,
         "admin",
@@ -128,7 +129,7 @@ def migrate(settings: Settings, *, dry_run: bool = False) -> RunStats:
     return run_scripts(
         settings,
         "admin",
-        [MIGRATION_SCRIPT],
+        [*MIGRATION_SCRIPTS],
         tolerate_idempotent_errors=True,
         dry_run=dry_run,
     )
@@ -278,7 +279,7 @@ def installed_objects(settings: Settings) -> dict[str, int]:
 
 def iter_scripts() -> Iterable[ScriptSpec]:
     yield from CORE_SCRIPTS
-    yield MIGRATION_SCRIPT
+    yield from MIGRATION_SCRIPTS
     yield SAMPLE_SCRIPT
     yield HARNESS_SCRIPT
     yield SCENARIOS_SCRIPT

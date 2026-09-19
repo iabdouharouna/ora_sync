@@ -239,6 +239,12 @@ CREATE TABLE SYNC_COMPATIBILITY_REPORT (
     -- FK_CYCLE_NOT_DEFERRABLE         : cycle FK comportant une contrainte non déferrable (grappe exclue, BLOCKING)
     -- FK_PARENT_ENROLLED (v4)         : parent FK absent de SYNC_TABLE_CONFIG, auto-enrôlé (WARNING)
     -- FK_PARENT_DISABLED (v4)         : parent FK présent mais désactivé en config, jamais forcé (WARNING)
+    -- PARENT_BACKFILLED (v5)          : parent re-inséré dans B depuis A (backfill ORA-02291) (WARNING)
+    -- FK_CHILD_RETRIED (v5)           : table enfant retentée après backfill du parent (WARNING)
+    -- FK_CYCLE_HANDLED_BY_DISABLE (v5): cycle FK traité par désactivation temporaire des FK sur B (WARNING)
+    -- TABLE_CREATED_IN_B (v5)         : table active absente de B, créée depuis les métadonnées A (WARNING)
+    -- PARENT_BACKFILL_FAILED (v5)     : backfill impossible (parent absent de A, table absente de B...) (BLOCKING)
+    -- FK_REPAIR_FAILED (v5)           : échec de réparation (désactivation/réactivation FK du cycle) (BLOCKING)
     ISSUE_TYPE       VARCHAR2(30)    NOT NULL,
 
     -- BLOCKING : la table est automatiquement exclue du run tant que
@@ -258,7 +264,9 @@ CREATE TABLE SYNC_COMPATIBILITY_REPORT (
             'MISSING_IN_A','MISSING_IN_B','TYPE_MISMATCH','LENGTH_MISMATCH',
             'NULLABLE_MISMATCH','PK_MISSING','PK_MISMATCH','UNSUPPORTED_TYPE',
             'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE',
-            'FK_PARENT_ENROLLED','FK_PARENT_DISABLED'
+            'FK_PARENT_ENROLLED','FK_PARENT_DISABLED',
+            'PARENT_BACKFILLED','FK_CHILD_RETRIED','FK_CYCLE_HANDLED_BY_DISABLE',
+            'TABLE_CREATED_IN_B','PARENT_BACKFILL_FAILED','FK_REPAIR_FAILED'
         )),
 
     CONSTRAINT CK_SCR_SEVERITY

@@ -59,6 +59,25 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     );
     TYPE t_fk_edge_tab IS TABLE OF t_fk_edge_rec INDEX BY PLS_INTEGER;
 
+    -- Une arête FK complète (v5 : backfill et réparation de cycles) -> types
+    --                                                               détaillés
+    TYPE t_fk_ref_col IS RECORD (
+        child_column    VARCHAR2(128),  -- colonne locale portant la FK
+        parent_column   VARCHAR2(128)   -- colonne référencée chez le parent
+    );
+    TYPE t_fk_ref_col_tab IS TABLE OF t_fk_ref_col INDEX BY PLS_INTEGER;
+    TYPE t_fk_ref_rec IS RECORD (
+        constraint_name VARCHAR2(128),
+        parent_table    VARCHAR2(128),  -- table référencée
+        deferrable      VARCHAR2(14),   -- 'DEFERRABLE' / 'NOT DEFERRABLE'
+        cols            t_fk_ref_col_tab,
+        child_nullable  BOOLEAN         -- VRAI si TOUTES les colonnes locales de la FK sont NULLABLE
+    );
+    TYPE t_fk_ref_tab IS TABLE OF t_fk_ref_rec INDEX BY PLS_INTEGER;
+
+    -- Table enregistrée comme visitée lors d'un parcours (backfill).
+    TYPE t_presence_map IS TABLE OF NUMBER INDEX BY VARCHAR2(128);
+
     -- Une table ordonnée dans sa grappe FK (cluster_id + ordre topologique).
     TYPE t_cluster_table_rec IS RECORD (
         cluster_id  NUMBER,
@@ -72,6 +91,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         cluster_id          NUMBER,
         avg_priority         NUMBER,
         requires_deferred    BOOLEAN,
+        requires_cycle_disable BOOLEAN,   -- v5 : cycle non déferrable à traiter par DISABLE_FK
         excluded              BOOLEAN,
         exclusion_reason      VARCHAR2(4000)
     );
@@ -925,6 +945,166 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     END get_sync_columns;
 
     --------------------------------------------------------------------------
+    -- exec_ddl_at_b (privée, v5)
+    --
+    -- Rôle : exécuter un DDL côté SCHEMA_B, localement (même instance) ou via
+    --        le DB LINK. Un DDL ne peut pas être expédié tel quel sur un lien :
+    --        on enrobe la commande dans un bloc anonyme exécuté A DISTANCE
+    --        (EXECUTE IMMEDIATE ... AT), ce qui l'exécute dans la session
+    --        distante du compte du lien — technique fiable, indépendante de la
+    --        présence du privilège sur l'instance locale.
+    -- Contrainte : le compte exécutant doit disposer du privilège requis côté
+    --        SCHEMA_B (ex. ALTER ANY TABLE pour désactiver une FK).
+    --------------------------------------------------------------------------
+    PROCEDURE exec_ddl_at_b(p_ddl IN VARCHAR2) IS
+    BEGIN
+        IF g_db_link_b IS NULL THEN
+            EXECUTE IMMEDIATE p_ddl;
+        ELSE
+            EXECUTE IMMEDIATE 'BEGIN EXECUTE IMMEDIATE :ddl; END;' AT g_db_link_b USING p_ddl;
+        END IF;
+    END exec_ddl_at_b;
+
+    --------------------------------------------------------------------------
+    -- auto_create_table_in_b (privée, v5)
+    --
+    -- Rôle : créer dans SCHEMA_B, par DDL dérivé des métadonnées de SCHEMA_A
+    --        (ALL_TAB_COLUMNS : types traduits, nullabilité, puis contrainte
+    --        PRIMARY KEY si la table source en a une), une table active
+    --        absente de B — service de CYCLE_HANDLING/AUTO_CREATE_MISSING_TABLE.
+    --        Les colonnes exclues par SYNC_COLUMN_CONFIG (sync_enabled='N') et
+    --        les types non supportés (LONG/LONG RAW, objets...) sont omis.
+    --        Les contraintes FK ne sont jamais recréées : elles suivront la
+    --        synchro suivante (backfill/ordre topologique).
+    -- Lève : E_INCOMPATIBLE_STRUCTURE si la dérivation DDL échoue côté B.
+    --------------------------------------------------------------------------
+    PROCEDURE auto_create_table_in_b(p_table_name IN VARCHAR2) IS
+        v_col_specs  VARCHAR2(32000) := '';
+        v_type_spec  VARCHAR2(4000);
+        v_char_used  VARCHAR2(1);
+        v_tbl_ref    VARCHAR2(257);
+        v_pk_name    VARCHAR2(128) := NULL;
+        v_key        t_str_tab;
+        v_pk_sql     VARCHAR2(32000);
+        v_excluded   t_str_tab;
+        v_skip       BOOLEAN;
+    BEGIN
+        SELECT column_name BULK COLLECT INTO v_excluded
+        FROM SYNC_COLUMN_CONFIG
+        WHERE table_name = p_table_name AND sync_enabled = 'N';
+
+        FOR r IN (
+            SELECT column_name, data_type, data_length, data_precision, data_scale,
+                   nullable, char_used
+            FROM ALL_TAB_COLUMNS
+            WHERE owner = C_SCHEMA_A AND table_name = p_table_name
+              AND data_type NOT IN ('LONG', 'LONG RAW')
+              AND data_type IS NOT NULL
+            ORDER BY column_id
+        ) LOOP
+            v_skip := FALSE;
+            FOR e IN 1 .. v_excluded.COUNT LOOP
+                IF v_excluded(e) = r.column_name THEN
+                    v_skip := TRUE;
+                    EXIT;
+                END IF;
+            END LOOP;
+            IF v_skip THEN
+                CONTINUE;
+            END IF;
+
+            v_type_spec := r.data_type;
+            IF r.data_type IN ('VARCHAR2','VARCHAR','CHAR','NVARCHAR2','NCHAR') THEN
+                v_type_spec := r.data_type || '(' || r.data_length;
+                IF r.char_used = 'C' THEN
+                    v_type_spec := v_type_spec || ' CHAR';
+                END IF;
+                v_type_spec := v_type_spec || ')';
+            ELSIF r.data_type IN ('NUMBER') THEN
+                IF r.data_precision IS NOT NULL THEN
+                    v_type_spec := 'NUMBER(' || r.data_precision;
+                    IF r.data_scale IS NOT NULL AND r.data_scale > 0 THEN
+                        v_type_spec := v_type_spec || ',' || r.data_scale;
+                    END IF;
+                    v_type_spec := v_type_spec || ')';
+                END IF;
+            ELSIF r.data_type LIKE 'TIMESTAMP%' OR r.data_type LIKE 'INTERVAL%' THEN
+                IF r.data_precision IS NOT NULL AND r.data_precision > 0 THEN
+                    v_type_spec := r.data_type || '(' || r.data_precision || ')';
+                END IF;
+            END IF;
+
+            v_col_specs := v_col_specs
+                || CHR(10) || '  ' || r.column_name || ' ' || v_type_spec
+                || CASE WHEN r.nullable = 'Y' THEN ' NULL' ELSE ' NOT NULL' END
+                || ',';
+        END LOOP;
+
+        IF TRIM(',' FROM v_col_specs) IS NULL THEN
+            RAISE E_INCOMPATIBLE_STRUCTURE;
+        END IF;
+
+        v_col_specs := SUBSTR(v_col_specs, 1, LENGTH(v_col_specs) - 1);
+        IF g_db_link_b IS NULL THEN
+            v_tbl_ref := C_SCHEMA_B || '.' || sanitize_ident(p_table_name);
+        ELSE
+            v_tbl_ref := sanitize_ident(p_table_name);
+        END IF;
+
+        v_attempted := TRUE;
+        exec_ddl_at_b('CREATE TABLE ' || v_tbl_ref || ' (' || v_col_specs || ')');
+
+        -- Contrainte PRIMARY KEY, si la table source en a une. Un échec
+        -- d'ajout (ex. nom de contrainte indisponible côté B) est NON fatal :
+        -- la table est créée sans PK, la compatibilité le signalera (PK_MISSING).
+        v_key := get_primary_or_unique_key(p_table_name);
+        IF v_key.COUNT > 0 THEN
+            BEGIN
+                SELECT constraint_name INTO v_pk_name
+                FROM ALL_CONSTRAINTS
+                WHERE owner = C_SCHEMA_A AND table_name = p_table_name AND constraint_type = 'P'
+                ORDER BY constraint_name
+                FETCH FIRST 1 ROWS ONLY;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    v_pk_name := NULL;
+            END;
+
+            BEGIN
+                v_pk_sql := 'ALTER TABLE ' || v_tbl_ref || ' ADD CONSTRAINT '
+                    || NVL(v_pk_name, 'SYS_C_' || TO_CHAR(SYSTIMESTAMP, 'YYYYMMDDHH24MISS'))
+                    || ' PRIMARY KEY (';
+                FOR i IN 1 .. v_key.COUNT LOOP
+                    v_pk_sql := v_pk_sql || (CASE WHEN i > 1 THEN ', ' ELSE '' END) || sanitize_ident(v_key(i));
+                END LOOP;
+                v_pk_sql := v_pk_sql || ')';
+                exec_ddl_at_b(v_pk_sql);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DECLARE
+                        v_pk_sql2 VARCHAR2(32000);
+                    BEGIN
+                        IF v_pk_name IS NOT NULL THEN
+                            v_pk_sql2 := 'ALTER TABLE ' || v_tbl_ref || ' ADD CONSTRAINT '
+                                || 'SYS_C_' || TO_CHAR(SYSTIMESTAMP, 'YYYYMMDDHH24MISS')
+                                || ' PRIMARY KEY (';
+                            FOR i IN 1 .. v_key.COUNT LOOP
+                                v_pk_sql2 := v_pk_sql2 || (CASE WHEN i > 1 THEN ', ' ELSE '' END) || sanitize_ident(v_key(i));
+                            END LOOP;
+                            v_pk_sql2 := v_pk_sql2 || ')';
+                            exec_ddl_at_b(v_pk_sql2);
+                        ELSE
+                            DBMS_OUTPUT.PUT_LINE('auto_create_table_in_b : PK non ajoutee pour ' || p_table_name
+                                || ' (' || SQLERRM || ')');
+                        END IF;
+                    END;
+            END;
+        END IF;
+
+        DBMS_OUTPUT.PUT_LINE('auto_create_table_in_b : ' || p_table_name || ' creee dans SCHEMA_B');
+    END auto_create_table_in_b;
+
+    --------------------------------------------------------------------------
     -- compat_check_core (privée)
     --
     -- Rôle : cœur du contrôle de compatibilité, partagé par les deux
@@ -950,7 +1130,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_table_names      IN t_str_tab,
         p_check_id         OUT NUMBER,
         p_has_blocking     OUT BOOLEAN,
-        p_enroll_fk        IN BOOLEAN DEFAULT FALSE
+        p_enroll_fk        IN BOOLEAN DEFAULT FALSE,
+        p_allow_ddl        IN BOOLEAN DEFAULT FALSE
     ) IS
         v_check_id      NUMBER := SYNC_COMPAT_CHECK_ID_SEQ.NEXTVAL;
         v_blocking      BOOLEAN := FALSE;
@@ -982,10 +1163,28 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             END IF;
 
             IF NOT table_exists(C_SCHEMA_B, v_cur_table, g_db_link_b) THEN
-                insert_compat_report(v_check_id, v_cur_table, NULL, 'MISSING_IN_B', C_SEVERITY_BLOCKING,
-                    'Table presente', 'Table absente');
-                v_blocking := TRUE;
-                CONTINUE;
+                -- v5 : création automatique si l'option le permet et que le
+                -- DDL est autorisé (run non sec, jamais en simple contrôle).
+                IF p_allow_ddl AND NVL(get_run_option(C_OPT_AUTO_CREATE_MISSING_TABLE), 'N') = 'Y' THEN
+                    BEGIN
+                        auto_create_table_in_b(v_cur_table);
+                        insert_compat_report(v_check_id, v_cur_table, NULL,
+                            C_ISSUE_TABLE_CREATED_IN_B, C_SEVERITY_WARNING,
+                            'Table absente de SCHEMA_B, creee depuis les metadonnees', 'Table creee');
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            insert_compat_report(v_check_id, v_cur_table, NULL,
+                                'MISSING_IN_B', C_SEVERITY_BLOCKING,
+                                'Table absente (creation automatique impossible : ' || SQLERRM || ')', 'Table absente');
+                            v_blocking := TRUE;
+                    END;
+                ELSE
+                    insert_compat_report(v_check_id, v_cur_table, NULL,
+                        'MISSING_IN_B', C_SEVERITY_BLOCKING,
+                        'Table presente', 'Table absente');
+                    v_blocking := TRUE;
+                    CONTINUE;
+                END IF;
             END IF;
 
             ------------------------------------------------------------------
@@ -1172,7 +1371,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END IF;
 
         compat_check_core(v_names, p_check_id, p_has_blocking_issues,
-            p_enroll_fk => (p_table_name IS NULL));
+            p_enroll_fk => (p_table_name IS NULL),
+            p_allow_ddl => FALSE);
 
         -- v4 : l'enrôlement automatique de la lignée FK est persisté pour le
         -- contrôle autonome (CHECK_COMPATIBILITY(NULL)).
@@ -1642,6 +1842,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                     v_all_deferrable BOOLEAN := TRUE;
                     v_prio           NUMBER;
                     v_cycle_msg      VARCHAR2(4000) := '';
+                    v_remaining      t_str_tab;
+                    v_rem_count      PLS_INTEGER := 0;
+                    v_tmp            VARCHAR2(128);
+                    v_disable_mode   BOOLEAN := FALSE;
                 BEGIN
                     FOR i IN 1 .. p_active_tables.COUNT LOOP
                         IF v_cluster_id(i) = v_cid THEN
@@ -1727,64 +1931,81 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                             END IF;
                         END LOOP;
 
-                        IF v_all_deferrable THEN
-                            -- Grappe acceptée avec contraintes différées ; ordre arbitraire
-                            -- déterministe (alphabétique) pour les tables restantes, car leur
-                            -- ordre relatif est sans importance tant que les FK ne sont
-                            -- vérifiées qu'au COMMIT (SET CONSTRAINTS ALL DEFERRED).
-                            DECLARE
-                                v_remaining t_str_tab;
-                                v_rem_count PLS_INTEGER := 0;
-                                v_tmp       VARCHAR2(128);
-                            BEGIN
-                                FOR i IN 1 .. v_m_count LOOP
-                                    IF NOT is_in_list(v_members(i), v_resolved) THEN
-                                        v_rem_count := v_rem_count + 1;
-                                        v_remaining(v_rem_count) := v_members(i);
-                                    END IF;
-                                END LOOP;
-                                FOR a IN 1 .. v_rem_count LOOP
-                                    FOR b IN a+1 .. v_rem_count LOOP
-                                        IF v_remaining(b) < v_remaining(a) THEN
-                                            v_tmp := v_remaining(a);
-                                            v_remaining(a) := v_remaining(b);
-                                            v_remaining(b) := v_tmp;
-                                        END IF;
-                                    END LOOP;
-                                END LOOP;
-                                FOR i IN 1 .. v_rem_count LOOP
-                                    v_order := v_order + 1;
-                                    v_out_idx := v_out_idx + 1;
-                                    p_tables(v_out_idx).cluster_id := v_cid;
-                                    p_tables(v_out_idx).table_name := v_remaining(i);
-                                    p_tables(v_out_idx).topo_order := v_order;
-                                END LOOP;
-                            END;
+                        -- Tri alphabétique des tables restantes du cycle : ordre
+                        -- arbitraire mais déterministe, sans importance relative
+                        -- (FK différées, ou désactivées par DISABLE_FK).
+                        v_rem_count := 0;
+                        FOR i IN 1 .. v_m_count LOOP
+                            IF NOT is_in_list(v_members(i), v_resolved) THEN
+                                v_rem_count := v_rem_count + 1;
+                                v_remaining(v_rem_count) := v_members(i);
+                            END IF;
+                        END LOOP;
+                        FOR a IN 1 .. v_rem_count LOOP
+                            FOR b IN a+1 .. v_rem_count LOOP
+                                IF v_remaining(b) < v_remaining(a) THEN
+                                    v_tmp := v_remaining(a);
+                                    v_remaining(a) := v_remaining(b);
+                                    v_remaining(b) := v_tmp;
+                                END IF;
+                            END LOOP;
+                        END LOOP;
 
-                            p_cluster_meta(v_meta_idx).requires_deferred := TRUE;
-                            p_cluster_meta(v_meta_idx).excluded          := FALSE;
+                        -- v5 : un cycle non déferrable peut être TRAITÉ (et non plus
+                        -- seulement exclu) si l'option CYCLE_HANDLING='DISABLE_FK' :
+                        -- la grappe est conservée, ses FK seront temporairement
+                        -- désactivées côté SCHEMA_B en exécution (échec possible
+                        -- => repli sur l'exclusion BLOCKING, géré dans execute_clusters).
+                        v_disable_mode := (NOT v_all_deferrable)
+                            AND NVL(get_run_option(C_OPT_CYCLE_HANDLING), 'BLOCK') = 'DISABLE_FK';
 
-                            -- Traçabilité même en cas d'acceptation : un cycle, même
-                            -- déferrable, reste une situation à surveiller. Une ligne
-                            -- PAR TABLE du cycle (et non une ligne unique avec la liste
-                            -- concaténée en TABLE_NAME, qui risquerait ORA-12899 dès que
-                            -- le cycle comporte plusieurs tables aux noms un peu longs :
-                            -- TABLE_NAME est VARCHAR2(128) et n'est prévue que pour UN nom).
+                        IF v_all_deferrable OR v_disable_mode THEN
+                            -- Grappe acceptée ; pour v_all_deferrable : FK différées
+                            -- (vérifiées au COMMIT). Pour v_disable_mode : FK du cycle
+                            -- désactivées temporairement côté B.
+                            FOR i IN 1 .. v_rem_count LOOP
+                                v_order := v_order + 1;
+                                v_out_idx := v_out_idx + 1;
+                                p_tables(v_out_idx).cluster_id := v_cid;
+                                p_tables(v_out_idx).table_name := v_remaining(i);
+                                p_tables(v_out_idx).topo_order := v_order;
+                            END LOOP;
+
+                            p_cluster_meta(v_meta_idx).requires_deferred    := v_all_deferrable;
+                            p_cluster_meta(v_meta_idx).requires_cycle_disable := v_disable_mode;
+                            p_cluster_meta(v_meta_idx).excluded             := FALSE;
+
+                            -- Traçabilité : une ligne PAR TABLE du cycle (même raison
+                            -- que le recours à une liste concaténée en TABLE_NAME :
+                            -- TABLE_NAME est VARCHAR2(128), réservé à UN nom).
                             FOR i IN 1 .. v_m_count LOOP
                                 IF NOT is_in_list(v_members(i), v_resolved) THEN
-                                    insert_compat_report(
-                                        p_check_id      => p_check_id,
-                                        p_table_name    => v_members(i),
-                                        p_column_name   => NULL,
-                                        p_issue_type    => C_ISSUE_FK_CYCLE_DEFERRABLE,
-                                        p_severity      => C_SEVERITY_WARNING,
-                                        p_detail_a      => 'Cycle deferrable accepte, contraintes differees pour ce run. Membres du cycle : ' || v_cycle_msg,
-                                        p_detail_b      => NULL
-                                    );
+                                    IF v_disable_mode THEN
+                                        insert_compat_report(
+                                            p_check_id      => p_check_id,
+                                            p_table_name    => v_members(i),
+                                            p_column_name   => NULL,
+                                            p_issue_type    => C_ISSUE_FK_CYCLE_HANDLED_BY_DISABLE,
+                                            p_severity      => C_SEVERITY_WARNING,
+                                            p_detail_a      => 'Cycle FK non deferrable traite par desactivation temporaire des FK cote B. Membres du cycle : ' || v_cycle_msg,
+                                            p_detail_b      => NULL
+                                        );
+                                    ELSE
+                                        insert_compat_report(
+                                            p_check_id      => p_check_id,
+                                            p_table_name    => v_members(i),
+                                            p_column_name   => NULL,
+                                            p_issue_type    => C_ISSUE_FK_CYCLE_DEFERRABLE,
+                                            p_severity      => C_SEVERITY_WARNING,
+                                            p_detail_a      => 'Cycle deferrable accepte, contraintes differees pour ce run. Membres du cycle : ' || v_cycle_msg,
+                                            p_detail_b      => NULL
+                                        );
+                                    END IF;
                                 END IF;
                             END LOOP;
                         ELSE
                             p_cluster_meta(v_meta_idx).requires_deferred := FALSE;
+                            p_cluster_meta(v_meta_idx).requires_cycle_disable := FALSE;
                             p_cluster_meta(v_meta_idx).excluded          := TRUE;
                             p_cluster_meta(v_meta_idx).exclusion_reason  :=
                                 'Cycle FK non deferrable detecte parmi : ' || v_cycle_msg;
@@ -2186,6 +2407,188 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         apply_to_local_target(p_run_id, p_table_name, p_key_cols, p_columns, p_dry_run, p_sync_mode,
             p_rows_inserted_b_to_a, p_rows_updated_b_to_a);
     END apply_table_diffs;
+
+
+    --------------------------------------------------------------------------
+    -- fk_parent_refs (privée, v5)
+    --
+    -- Rôle : renvoyer les arêtes FK EFFECTIVES portées par une table de
+    --        SCHEMA_A (ALL_CONSTRAINTS référence visibles), avec leurs
+    --        colonnes (enfant/parent) et la nullabilité de la colonne enfant.
+    --        Sert au backfill des parents manquants et à la réparation des
+    --        cycles (liste des contraintes à désactiver/re-activer côté B).
+    -- NB : la nullabilité enfant sert à décider si une référence manquante
+    --      peut être neutralisée (colonnes NULL) plutôt que de déclencher un
+    --      backfill ; le champ deferrable dit si la contrainte peut être
+    --      contournée par SET CONSTRAINTS ALL DEFERRED dans un run.
+    --------------------------------------------------------------------------
+    FUNCTION fk_parent_refs(p_child_table IN VARCHAR2) RETURN t_fk_ref_tab IS
+        v_result t_fk_ref_tab;
+        v_idx    PLS_INTEGER := 0;
+    BEGIN
+        FOR r IN (
+            SELECT c.constraint_name, c.deferrable,
+                   pc.table_name AS parent_table,
+                   chi.column_name AS child_column,
+                   par.column_name AS parent_column,
+                   cols.nullable AS child_nullable
+            FROM ALL_CONSTRAINTS c
+            JOIN ALL_CONS_COLUMNS chi
+              ON chi.owner = c.owner AND chi.constraint_name = c.constraint_name
+             AND chi.table_name = c.table_name
+            JOIN ALL_CONSTRAINTS pc
+              ON pc.owner = c.r_owner AND pc.constraint_name = c.r_constraint_name
+            JOIN ALL_CONS_COLUMNS par
+              ON par.owner = pc.owner AND par.constraint_name = pc.constraint_name
+             AND par.table_name = pc.table_name AND par.position = chi.position
+            JOIN ALL_TAB_COLUMNS cols
+              ON cols.owner = c.owner AND cols.table_name = c.table_name
+             AND cols.column_name = chi.column_name
+            WHERE c.owner = C_SCHEMA_A
+              AND c.constraint_type = 'R'
+              AND c.table_name = p_child_table
+              AND c.status = 'ENABLED'
+              AND c.deleted = 'NO'
+              AND pc.owner = C_SCHEMA_A
+              AND cols.hidden = 'NO'
+            ORDER BY c.constraint_name, chi.position
+        ) LOOP
+            IF v_result.COUNT = 0 OR v_result(v_result.COUNT).constraint_name != r.constraint_name THEN
+                v_idx := v_result.COUNT + 1;
+                v_result(v_idx).constraint_name := r.constraint_name;
+                v_result(v_idx).parent_table    := r.parent_table;
+                v_result(v_idx).deferrable      := r.deferrable;
+                v_result(v_idx).child_nullable  := TRUE;
+            END IF;
+            v_result(v_idx).cols(v_result(v_idx).cols.COUNT + 1).child_column  := r.child_column;
+            v_result(v_idx).cols(v_result(v_idx).cols.COUNT).parent_column := r.parent_column;
+            IF r.child_nullable != 'Y' THEN
+                v_result(v_idx).child_nullable := FALSE;
+            END IF;
+        END LOOP;
+
+        RETURN v_result;
+    END fk_parent_refs;
+
+    --------------------------------------------------------------------------
+    -- insert_missing_parent_rows (privée, v5)
+    --
+    -- Rôle : re-insérer dans SCHEMA_B les lignes PARENTE manquantes référencées
+    --        par les lignes de p_child_table classées INSERT_TO_B pour le run,
+    --        en copiant depuis SCHEMA_A la ligne parente complète (colonnes
+    --        synchronisées). Ne copie QUE les parents effectivement absents de
+    --        B (NOT EXISTS sur la clé parente) : opération idempotente et
+    --        sûre en cas de ré-exécution.
+    -- Retour : nombre de lignes parente insérées. Une exception est absorbée
+    --          et tracée (PARENT_BACKFILL_FAILED, BLOCKING) — l'échec du
+    --          backfill ne remonte PAS ici : il accule l'enfant, qui sera
+    --          journalisé en FAILED par le mécanisme normal si la retentative
+    --          échoue à son tour.
+    --------------------------------------------------------------------------
+    FUNCTION insert_missing_parent_rows(
+        p_child_table   IN VARCHAR2,
+        p_run_id        IN NUMBER,
+        p_ref           IN t_fk_ref_rec,
+        p_check_id      IN NUMBER
+    ) RETURN NUMBER IS
+        v_parent       VARCHAR2(128) := p_ref.parent_table;
+        v_parent_key   t_str_tab;
+        v_pcols        t_column_tab;
+        v_child_key    t_str_tab;
+        v_child_types  t_coltype_tab;
+        v_parent_types t_coltype_tab;
+        v_all_cols     VARCHAR2(32767);
+        v_pair         VARCHAR2(32767) := '';
+        v_stmt         VARCHAR2(32767);
+        v_rows         NUMBER := 0;
+    BEGIN
+        v_parent_key  := get_effective_key(v_parent);
+        v_child_key   := get_effective_key(p_child_table);
+        v_pcols       := get_sync_columns(v_parent, v_parent_key);
+        v_child_types := get_col_type_map(p_child_table);
+        v_parent_types := get_col_type_map(v_parent);
+
+        IF v_parent_key.COUNT = 0 OR v_child_key.COUNT = 0 OR v_pcols.COUNT = 0 THEN
+            insert_compat_report(p_check_id, v_parent,
+                NULL, C_ISSUE_PARENT_BACKFILL_FAILED, C_SEVERITY_BLOCKING,
+                'Backfill inapplicable : cle ou colonnes synchronisees indisponibles pour ' || v_parent, NULL);
+            RETURN 0;
+        END IF;
+
+        FOR i IN 1 .. v_pcols.COUNT LOOP
+            v_all_cols := v_all_cols
+                || CASE WHEN v_all_cols IS NOT NULL THEN ',' END
+                || sanitize_ident(v_pcols(i).column_name);
+        END LOOP;
+        IF v_all_cols IS NULL THEN
+            RETURN 0;
+        END IF;
+
+        -- Correspondance colonnes-à-colonnes local -> distant (identifiant
+        -- la ligne parente référencée par l'enfant), sur les colonnes de la FK.
+        FOR c IN 1 .. p_ref.cols.COUNT LOOP
+            v_pair := v_pair
+                || CASE WHEN v_pair IS NOT NULL THEN ' AND ' END
+                || 'ch.' || sanitize_ident(p_ref.cols(c).child_column)
+                || ' = p.' || sanitize_ident(p_ref.cols(c).parent_column);
+        END LOOP;
+
+        v_stmt :=
+            'INSERT INTO ' || b_table_ref(v_parent) || ' (' || v_all_cols || ') ' ||
+            'SELECT ' || v_all_cols || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || sanitize_ident(v_parent) || ' p ' ||
+            'WHERE EXISTS (SELECT 1 FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || sanitize_ident(p_child_table) || ' ch ' ||
+            '   WHERE ' || v_pair ||
+            '     AND ' || build_key_expr_aliased(v_child_key, 'ch.', v_child_types) ||
+            ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :ct ' ||
+            '     AND diff_type = ''INSERT_TO_B'')) ' ||
+            ' AND NOT EXISTS (SELECT 1 FROM ' || b_table_ref(v_parent) || ' bp WHERE ' ||
+            build_on_clause(v_parent_key, 'bp', 'p') || ')';
+
+        EXECUTE IMMEDIATE v_stmt USING p_run_id, p_child_table;
+        v_rows := SQL%ROWCOUNT;
+
+        IF v_rows > 0 THEN
+            insert_compat_report(p_check_id, v_parent, NULL,
+                C_ISSUE_PARENT_BACKFILLED, C_SEVERITY_WARNING,
+                'Parent reinsere dans SCHEMA_B depuis SCHEMA_A (backfill) : ' || v_rows || ' ligne(s)', NULL);
+        END IF;
+
+        RETURN v_rows;
+    EXCEPTION
+        WHEN OTHERS THEN
+            insert_compat_report(p_check_id, v_parent,
+                NULL, C_ISSUE_PARENT_BACKFILL_FAILED, C_SEVERITY_BLOCKING,
+                'Backfill impossible pour ' || v_parent || ' : ' || SQLERRM, NULL);
+            RETURN 0;
+    END insert_missing_parent_rows;
+
+
+    --------------------------------------------------------------------------
+    -- backfill_missing_parents (privée, v5)
+    --
+    -- Rôle : point d'entrée du backfill pour une table : repère les arêtes FK
+    --        portées par la table, et re-insère chacun des parents manquants.
+    --        Les chaînes multi-niveaux sont résolues naturellement au fil du
+    --        run (chaque ancêtre est lui-même un table du run — enrôlée en v4 —
+    --        et son propre INSERT_TO_B déclenchera son propre backfill, dans
+    --        l'ordre topologique parent-d'abord de la grappe).
+    -- Retour : nombre TOTAL de lignes parente insérées (tous parents).
+    --------------------------------------------------------------------------
+    FUNCTION backfill_missing_parents(
+        p_child_table   IN VARCHAR2,
+        p_run_id        IN NUMBER,
+        p_check_id      IN NUMBER
+    ) RETURN NUMBER IS
+        v_refs   t_fk_ref_tab := fk_parent_refs(p_child_table);
+        v_total  NUMBER := 0;
+        v_inserted NUMBER;
+    BEGIN
+        FOR i IN 1 .. v_refs.COUNT LOOP
+            v_inserted := insert_missing_parent_rows(p_child_table, p_run_id, v_refs(i), p_check_id);
+            v_total := v_total + v_inserted;
+        END LOOP;
+        RETURN v_total;
+    END backfill_missing_parents;
 
     ----------------------------------------------------------------------
     -- Décision de conception (granularité de reprise) : SAVEPOINT PAR TABLE
@@ -2613,6 +3016,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_topo_order    IN  NUMBER,
         p_sync_mode     IN  VARCHAR2,      -- override de run (sentinelle = suivre la config)
         p_dry_run       IN  BOOLEAN,
+        p_check_id      IN  NUMBER,        -- v5 : traçabilité backfill/réparation FK
         p_status        OUT VARCHAR2
     ) IS
         v_log_id            NUMBER := SYNC_LOG_ID_SEQ.NEXTVAL;
@@ -2624,9 +3028,27 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_upd_bta           NUMBER := 0;
         v_conflict_count    NUMBER := 0;
         v_eff_mode          VARCHAR2(20);
+        v_auto_bf           BOOLEAN;
+        v_max_tries         PLS_INTEGER := 1;
+        v_tries             PLS_INTEGER := 0;
+        v_bf_total          PLS_INTEGER := 0;
     BEGIN
         -- Mode d'application effectif : override de run, sinon SYNC_MODE configuré.
         v_eff_mode := resolve_effective_mode(p_table_name, p_sync_mode);
+
+        -- v5 : options d'auto-réparation FK (backfill des parents manquants).
+        v_auto_bf := NVL(get_run_option(C_OPT_AUTO_BACKFILL_PARENTS), 'Y') = 'Y';
+        IF v_auto_bf THEN
+            BEGIN
+                v_max_tries := TO_NUMBER(NVL(get_run_option(C_OPT_MAX_FK_RETRY), '3'));
+                IF v_max_tries < 1 THEN
+                    v_max_tries := 1;
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    v_max_tries := 1;
+            END;
+        END IF;
 
         INSERT INTO SYNC_LOG (log_id, run_id, table_name, status, cluster_id, cluster_order, sync_mode)
         VALUES (v_log_id, p_run_id, p_table_name, C_STATUS_IN_PROGRESS, p_cluster_id, p_topo_order, v_eff_mode);
@@ -2638,8 +3060,48 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         run_diagnostic(p_run_id, p_table_name);
         resolve_table_diffs(p_run_id, p_table_name, v_key);
 
-        apply_table_diffs(p_run_id, p_table_name, v_key, v_columns, p_dry_run, v_eff_mode,
-            v_ins_atb, v_ins_bta, v_upd_atb, v_upd_bta);
+        -- Application direction A->B avec AUTO-RÉPARATION FK (v5) : si un
+        -- INSERT enfant échoue sur ORA-02291 (parent absent de SCHEMA_B),
+        -- l'énoncé est annulé automatiquement (atomicité d'énoncé), les
+        -- parents manquants sont re-insérés depuis SCHEMA_A (backfill), puis
+        -- le run réessaie jusqu'à MAX_FK_RETRY tentatives. Ce mécanisme
+        -- complète l'auto-ENRÔLEMENT de la lignée (v4) : les ancêtres font
+        -- partie du run et leurs OWN inserts sont réparés de la même façon,
+        -- de sorte que les chaînes multi-niveaux se résolvent naturellement,
+        -- grappe (ordre topologique parent d'abord) après grappe.
+        -- NB : les lignes diff restent valides pour la retentative (le backfill
+        --      ne les modifie pas) ; le cas où le backfill échoue OU sature
+        --      les tentatives remonte en ORA-02291 -> table en FAILED (BLOCKING
+        --      PARENT_BACKFILL_FAILED journalisé), comportement historique
+        --      préservé par défaut via AUTO_BACKFILL_PARENTS='N'.
+        LOOP
+            v_tries := v_tries + 1;
+            BEGIN
+                apply_to_remote_target(p_run_id, p_table_name, v_key, v_columns, p_dry_run, v_eff_mode,
+                    v_ins_atb, v_upd_atb);
+                EXIT;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    IF SQLCODE = -2291 AND v_auto_bf AND v_tries < v_max_tries THEN
+                        v_bf_total := v_bf_total
+                            + backfill_missing_parents(p_table_name, p_run_id, p_check_id);
+                        IF v_bf_total > 0 THEN
+                            insert_compat_report(p_check_id, p_table_name, NULL,
+                                C_ISSUE_FK_CHILD_RETRIED, C_SEVERITY_WARNING,
+                                'Table retentee apres backfill de ' || v_bf_total || ' parent(s) (MAX_FK_RETRY=' || v_max_tries || ')',
+                                NULL);
+                        END IF;
+                    ELSE
+                        RAISE;
+                    END IF;
+            END;
+        END LOOP;
+
+        -- Application direction B->A (table BIDIRECTIONAL) : aucun backfill
+        -- n'est tenté sur cette direction (l'asymétrie "parents en A" ne
+        -- s'applique pas à l'insertion cible SCHEMA_A).
+        apply_to_local_target(p_run_id, p_table_name, v_key, v_columns, p_dry_run, v_eff_mode,
+            v_ins_bta, v_upd_bta);
 
         -- Nombre de conflits RÉELS journalisés pour cette table : les écarts
         -- forcés par une direction unique (DIRECTION_FORCED) ne sont pas des
@@ -2718,6 +3180,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         p_dry_run           IN  BOOLEAN,
         p_error_mode        IN  VARCHAR2,
         p_sync_mode         IN  VARCHAR2,
+        p_check_id          IN  NUMBER,
         p_success_count     IN OUT NUMBER,
         p_conflict_count    IN OUT NUMBER,
         p_failed_count      IN OUT NUMBER,
@@ -2733,7 +3196,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 SAVEPOINT sp_table;
                 BEGIN
                     process_one_table(p_run_id, p_cluster_tables(i).table_name, p_cluster_id,
-                        p_cluster_tables(i).topo_order, p_sync_mode, p_dry_run, v_status);
+                        p_cluster_tables(i).topo_order, p_sync_mode, p_dry_run, p_check_id, v_status);
 
                     IF v_status = C_STATUS_SUCCESS THEN
                         p_success_count := p_success_count + 1;
@@ -2880,6 +3343,137 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     ----------------------------------------------------------------------
+    -- b_ddl_table_ref (privée, v5)
+    --
+    -- Rôle : référence de table adaptée à un DDL côté SCHEMA_B. Contrairement
+    --        à b_table_ref (DML, suffixe @link), un DDL ne supporte pas le
+    --        pont DB LINK. Le DDL est TOUJOURS qualifié par C_SCHEMA_B : la
+    --        session du lien (ORASYNC_LINK_USER=SYNC_ADMIN) ne doit PAS être
+    --        confondue avec le propriétaire réel des tables (SCHEMA_B) — seul
+    --        un compte disposant des privilèges système requis (CREATE ANY
+    --        TABLE, ALTER ANY TABLE) peut l'exécuter au travers du lien.
+    ----------------------------------------------------------------------
+    FUNCTION b_ddl_table_ref(p_table_name IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN C_SCHEMA_B || '.' || sanitize_ident(p_table_name);
+    END b_ddl_table_ref;
+
+
+    --------------------------------------------------------------------------
+    -- disable_cluster_fks / enable_cluster_fks (privées, v5)
+    --
+    -- Rôle : désactiver (respectivement réactiver), côté SCHEMA_B, les
+    --        contraintes FK NON DÉFERRABLES dont les deux extrémités
+    --        appartiennent à la même grappe cyclique (option
+    --        CYCLE_HANDLING='DISABLE_FK'). Les FKs déferrables restent
+    --        confiées au SET CONSTRAINTS ALL DEFERRED ; les autres FKs (vers
+    --        des tables hors grappe) sont hors de propos (données parentes
+    --        déjà présentes en B) et ne sont pas touchées.
+    -- Sécurité : si la désactivation échoue en cours de route (ex. contrainte
+    --        absente de B sous un autre nom), les contraintes DÉJÀ désactivées
+    --        sont immédiatement réactivées puis l'erreur est propagée vers
+    --        execute_clusters, qui replie la grappe sur l'exclusion BLOCKING.
+    --        La réactivation est systématique en fin de grappe, y compris sur
+    --        échec de table (process_cluster encaisse) — un run ne doit JAMAIS
+    --        laisser une FK désactivée derrière lui.
+    --------------------------------------------------------------------------
+    FUNCTION disable_cluster_fks(
+        p_cluster_id      IN  NUMBER,
+        p_cluster_tables  IN  t_cluster_table_tab
+    ) RETURN t_str_tab IS
+        v_done      t_str_tab;   -- 'child_table|constraint_name' désactivées
+        v_refs      t_fk_ref_tab;
+        v_member    BOOLEAN;
+        v_token     VARCHAR2(257);
+    BEGIN
+        FOR i IN 1 .. p_cluster_tables.COUNT LOOP
+            IF p_cluster_tables(i).cluster_id = p_cluster_id THEN
+                v_refs := fk_parent_refs(p_cluster_tables(i).table_name);
+                FOR r IN 1 .. v_refs.COUNT LOOP
+                    IF v_refs(r).deferrable = 'DEFERRABLE' THEN
+                        CONTINUE;
+                    END IF;
+                    v_member := FALSE;
+                    FOR j IN 1 .. p_cluster_tables.COUNT LOOP
+                        IF p_cluster_tables(j).cluster_id = p_cluster_id
+                           AND p_cluster_tables(j).table_name = v_refs(r).parent_table THEN
+                            v_member := TRUE;
+                            EXIT;
+                        END IF;
+                    END LOOP;
+                    IF NOT v_member THEN
+                        CONTINUE;
+                    END IF;
+
+                    v_token := p_cluster_tables(i).table_name || '|' || v_refs(r).constraint_name;
+                    IF is_in_list(v_token, v_done) THEN
+                        CONTINUE;
+                    END IF;
+
+                    BEGIN
+                        exec_ddl_at_b('ALTER TABLE ' || b_ddl_table_ref(p_cluster_tables(i).table_name)
+                            || ' DISABLE CONSTRAINT ' || sanitize_ident(v_refs(r).constraint_name));
+                        v_done(v_done.COUNT + 1) := v_token;
+                        DBMS_OUTPUT.PUT_LINE('disable_cluster_fks : FK ' || v_refs(r).constraint_name
+                            || ' desactivee sur ' || p_cluster_tables(i).table_name);
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            -- Réactivation immédiate du travail déjà fait, puis
+                            -- propagation (execute_clusters replie en BLOCKING).
+                            FOR k IN 1 .. v_done.COUNT LOOP
+                                DECLARE
+                                    v_t  VARCHAR2(128) := SUBSTR(v_done(k), 1, INSTR(v_done(k), '|') - 1);
+                                    v_c  VARCHAR2(128) := SUBSTR(v_done(k), INSTR(v_done(k), '|') + 1);
+                                BEGIN
+                                    exec_ddl_at_b('ALTER TABLE ' || b_ddl_table_ref(v_t)
+                                        || ' ENABLE CONSTRAINT ' || sanitize_ident(v_c));
+                                EXCEPTION
+                                    WHEN OTHERS THEN
+                                        NULL; -- propagée plus bas ; on re-tente les suivantes
+                                END;
+                            END LOOP;
+                            RAISE;
+                    END;
+                END LOOP;
+            END IF;
+        END LOOP;
+
+        RETURN v_done;
+    END disable_cluster_fks;
+
+
+    PROCEDURE enable_cluster_fks(
+        p_disabled        IN  t_str_tab,
+        p_cluster_id      IN  NUMBER,
+        p_cluster_tables  IN  t_cluster_table_tab
+    ) IS
+        v_refs    t_fk_ref_tab;
+        v_found   BOOLEAN;
+    BEGIN
+        FOR i IN 1 .. p_cluster_tables.COUNT LOOP
+            IF p_cluster_tables(i).cluster_id = p_cluster_id THEN
+                v_refs := fk_parent_refs(p_cluster_tables(i).table_name);
+                FOR r IN 1 .. v_refs.COUNT LOOP
+                    v_found := FALSE;
+                    FOR k IN 1 .. p_disabled.COUNT LOOP
+                        IF p_disabled(k) = p_cluster_tables(i).table_name || '|' || v_refs(r).constraint_name THEN
+                            v_found := TRUE;
+                            EXIT;
+                        END IF;
+                    END LOOP;
+                    IF v_found THEN
+                        exec_ddl_at_b('ALTER TABLE ' || b_ddl_table_ref(p_cluster_tables(i).table_name)
+                            || ' ENABLE CONSTRAINT ' || sanitize_ident(v_refs(r).constraint_name));
+                        DBMS_OUTPUT.PUT_LINE('enable_cluster_fks : FK ' || v_refs(r).constraint_name
+                            || ' reactivee sur ' || p_cluster_tables(i).table_name);
+                    END IF;
+                END LOOP;
+            END IF;
+        END LOOP;
+    END enable_cluster_fks;
+
+
+    ----------------------------------------------------------------------
     -- execute_clusters (privée)
     --
     -- Rôle : point commun d'exécution de la phase "grappes" d'un run, partagé
@@ -2945,8 +3539,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             EXIT WHEN v_stopped_early;
 
             DECLARE
-                v_meta_idx  PLS_INTEGER := v_ordered_idx(oi);
-                v_cid       NUMBER := v_cluster_meta(v_meta_idx).cluster_id;
+                v_meta_idx     PLS_INTEGER := v_ordered_idx(oi);
+                v_cid          NUMBER := v_cluster_meta(v_meta_idx).cluster_id;
+                v_disabled     t_str_tab;
+                v_need_reenable BOOLEAN := FALSE;
+                v_skip_cluster BOOLEAN := FALSE;
             BEGIN
                 IF v_cluster_meta(v_meta_idx).requires_deferred THEN
                     EXECUTE IMMEDIATE 'SET CONSTRAINTS ALL DEFERRED';
@@ -2954,8 +3551,58 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                     -- uniquement, cf. commentaire détaillé en Partie 3.
                 END IF;
 
-                process_cluster(p_run_id, v_cid, v_cluster_tables, p_dry_run, p_error_mode, p_sync_mode,
-                    v_success_count, v_conflict_count, v_failed_count, v_stopped_early);
+                -- v5 : cycle FK non déferrable -> désactivation temporaire des
+                -- FKs du cycle côté SCHEMA_B (option CYCLE_HANDLING=DISABLE_FK).
+                -- En cas d'échec de désactivation, la grappe est repliée sur
+                -- l'exclusion BLOCKING (comportement historique) : les FKs
+                -- éventuellement déjà désactivées ont été réactivées en interne.
+                IF v_cluster_meta(v_meta_idx).requires_cycle_disable THEN
+                    BEGIN
+                        v_disabled := disable_cluster_fks(v_cid, v_cluster_tables);
+                        v_need_reenable := TRUE;
+                        v_skip_cluster := FALSE;
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            FOR j IN 1 .. v_cluster_tables.COUNT LOOP
+                                IF v_cluster_tables(j).cluster_id = v_cid THEN
+                                    v_excluded_count := v_excluded_count + 1;
+                                    insert_compat_report(
+                                        p_check_id      => p_check_id,
+                                        p_table_name    => v_cluster_tables(j).table_name,
+                                        p_column_name   => NULL,
+                                        p_issue_type    => C_ISSUE_FK_CYCLE_NOT_DEFERRABLE,
+                                        p_severity      => C_SEVERITY_BLOCKING,
+                                        p_detail_a      => 'Desactivation FK impossible cote B (repli BLOCK) : ' || SUBSTR(SQLERRM, 1, 4000),
+                                        p_detail_b      => NULL
+                                    );
+                                END IF;
+                            END LOOP;
+                            v_skip_cluster := TRUE;
+                            v_need_reenable := FALSE;
+                    END;
+                END IF;
+
+                IF NOT v_skip_cluster THEN
+                    process_cluster(p_run_id, v_cid, v_cluster_tables, p_dry_run, p_error_mode, p_sync_mode,
+                        p_check_id, v_success_count, v_conflict_count, v_failed_count, v_stopped_early);
+                END IF;
+
+                -- Réactivation systématique des FKs désactivées pour cette
+                -- grappe (on ne laisse JAMAIS une FK désactivée derrière soi ;
+                -- un échec ici est structurel : run FAILED + RAISE).
+                IF v_need_reenable THEN
+                    BEGIN
+                        enable_cluster_fks(v_disabled, v_cid, v_cluster_tables);
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            ROLLBACK;
+                            UPDATE SYNC_RUN_HEADER SET
+                                end_date = SYSTIMESTAMP, status = C_STATUS_FAILED
+                            WHERE run_id = p_run_id;
+                            COMMIT;
+                            RAISE E_FK_CYCLE_DETECTED;
+                    END;
+                END IF;
 
                 COMMIT; -- commit de la grappe entière (décision validée), qu'elle
                         -- contienne ou non des tables en échec (celles-ci ont déjà
@@ -2980,7 +3627,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             status = v_final_status,
             tables_success = v_success_count,
             tables_conflict = v_conflict_count,
-            tables_failed = v_failed_count
+            tables_failed = v_failed_count,
+            tables_excluded = v_excluded_count
         WHERE run_id = p_run_id;
         COMMIT;
 
@@ -3017,6 +3665,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_total_tables      NUMBER := 0;
         v_config_count      NUMBER;
         v_discovered_count  NUMBER;
+        v_names             t_str_tab;
         -- Oracle SQL n'a pas de type BOOLEAN (contrairement à PL/SQL) : un
         -- paramètre IN BOOLEAN ne peut jamais être référencé, même via
         -- CASE WHEN, à l'intérieur d'une instruction SQL statique (INSERT/
@@ -3052,8 +3701,26 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
         ------------------------------------------------------------------
         -- 1) Compatibilité (systématique en tête de run, décision validée)
+        -- Invoqué en interne (compat_check_core, NON via l'overload public) :
+        -- p_enroll_fk=TRUE pour l'auto-enrôlement v4 des parents FK, et
+        -- p_allow_ddl=NOT p_dry_run pour laisser l'auto-création v5 créer en B
+        -- les tables actives absentes (option AUTO_CREATE_MISSING_TABLE) sur un
+        -- vrai run — jamais sur un dry-run ni sur un contrôle autonome.
         ------------------------------------------------------------------
-        CHECK_COMPATIBILITY(p_table_name => NULL, p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
+        SELECT table_name BULK COLLECT INTO v_names
+        FROM SYNC_TABLE_CONFIG
+        WHERE enabled = 'Y';
+
+        -- v4 : fermeture COMPLÈTE de la lignée FK côté SCHEMA_A (seeds ∪ ancêtres).
+        IF v_names.COUNT > 0 THEN
+            v_names := build_fk_ancestors_raw(v_names);
+        END IF;
+
+        compat_check_core(v_names, v_check_id, v_blocking,
+            p_enroll_fk => TRUE, p_allow_ddl => NOT p_dry_run);
+
+        -- v4 : persistance de l'enrôlement automatique de la lignée FK.
+        COMMIT;
 
         -- TOTAL_TABLES = ensemble de référence : nombre de tables ACTIVES
         -- avant filtrage des blocages (corrige le bug v1 où total valait le
@@ -3146,7 +3813,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
         p_run_id := v_run_id;
 
-        CHECK_COMPATIBILITY(p_table_name => p_table_name, p_check_id => v_check_id, p_has_blocking_issues => v_blocking);
+        DECLARE
+            v_single t_str_tab;
+        BEGIN
+            v_single(1) := p_table_name;
+            -- v5 : p_allow_ddl=NOT p_dry_run autorise l'auto-création en B de la
+            -- table si l'option AUTO_CREATE_MISSING_TABLE='Y' (run réel uniquement).
+            compat_check_core(v_single, v_check_id, v_blocking,
+                p_enroll_fk => FALSE, p_allow_ddl => NOT p_dry_run);
+        END;
 
         IF v_blocking THEN
             UPDATE SYNC_RUN_HEADER SET
@@ -3163,7 +3838,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
         SAVEPOINT sp_table;
         BEGIN
-            process_one_table(v_run_id, p_table_name, NULL, 1, p_sync_mode, p_dry_run, v_status);
+            process_one_table(v_run_id, p_table_name, NULL, 1, p_sync_mode, p_dry_run, v_check_id, v_status);
             v_final_status := v_status;
             COMMIT;
         EXCEPTION
@@ -3283,7 +3958,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         --    avec ce qui est réellement exécuté.
         v_total := v_run_set.COUNT;
 
-        compat_check_core(v_run_set, v_check_id, v_blocking, p_enroll_fk => TRUE);
+        compat_check_core(v_run_set, v_check_id, v_blocking,
+            p_enroll_fk => TRUE, p_allow_ddl => NOT p_dry_run);
 
         -- v4 : l'enrôlement automatique de la lignée FK est persisté.
         COMMIT;
@@ -3395,6 +4071,48 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         OPEN p_detail_cursor FOR
             SELECT * FROM SYNC_LOG WHERE run_id = p_run_id ORDER BY cluster_id NULLS FIRST, cluster_order;
     END GET_RUN_STATUS;
+
+
+    ----------------------------------------------------------------------
+    -- SET_RUN_OPTION  (procédure publique, v5)
+    ----------------------------------------------------------------------
+    PROCEDURE SET_RUN_OPTION (p_option_name IN VARCHAR2, p_option_value IN VARCHAR2) IS
+        v_name VARCHAR2(64) := UPPER(TRIM(p_option_name));
+    BEGIN
+        IF v_name NOT IN (C_OPT_AUTO_BACKFILL_PARENTS, C_OPT_MAX_FK_RETRY,
+                          C_OPT_CYCLE_HANDLING, C_OPT_AUTO_CREATE_MISSING_TABLE) THEN
+            RAISE E_INVALID_PARAMETER;
+        END IF;
+
+        MERGE INTO SYNC_RUN_OPTION t
+        USING (SELECT v_name AS option_name, p_option_value AS option_value FROM DUAL) s
+        ON (t.option_name = s.option_name)
+        WHEN MATCHED THEN UPDATE SET option_value = s.option_value,
+                                     updated_date = SYSTIMESTAMP, updated_by = USER
+        WHEN NOT MATCHED THEN INSERT (option_name, option_value, updated_by)
+            VALUES (s.option_name, s.option_value, USER);
+
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('SET_RUN_OPTION : ' || v_name || ' = ' || p_option_value);
+    END SET_RUN_OPTION;
+
+
+    ----------------------------------------------------------------------
+    -- GET_RUN_OPTION  (fonction publique, v5)
+    ----------------------------------------------------------------------
+    FUNCTION GET_RUN_OPTION (p_option_name IN VARCHAR2) RETURN VARCHAR2 IS
+        v_value VARCHAR2(256);
+    BEGIN
+        BEGIN
+            SELECT option_value INTO v_value
+            FROM SYNC_RUN_OPTION
+            WHERE option_name = p_option_name;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                v_value := NULL;
+        END;
+        RETURN v_value;
+    END GET_RUN_OPTION;
 
 END PKG_SCHEMA_SYNC;
 /

@@ -64,7 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser(
-        "migrate", help="applique la migration idempotente 08", parents=[common]
+        "migrate", help="applique les migrations idempotentes 08 puis 10", parents=[common]
     )
 
     sample = sub.add_parser(

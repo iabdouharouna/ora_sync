@@ -140,6 +140,36 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     C_ISSUE_FK_PARENT_ENROLLED      CONSTANT VARCHAR2(30) := 'FK_PARENT_ENROLLED';
     C_ISSUE_FK_PARENT_DISABLED      CONSTANT VARCHAR2(30) := 'FK_PARENT_DISABLED';
 
+    -- Types d'anomalie liés à l'auto-réparation FK dans SCHEMA_B (v5) :
+    -- PARENT_BACKFILLED      : parent absent de B, re-inséré depuis A après un
+    --                          ORA-02291 sur l'enfant (WARNING)
+    -- FK_CHILD_RETRIED       : table enfant retentée après backfill (WARNING)
+    -- FK_CYCLE_HANDLED_BY_DISABLE : cycle FK non déferrable, FK temporairement
+    --                          désactivées côté B puis réactivées (WARNING)
+    -- TABLE_CREATED_IN_B     : table active absente de B, créée en DDL depuis
+    --                          les métadonnées de A (WARNING)
+    -- PARENT_BACKFILL_FAILED : backfill impossible (parent indisponible dans A,
+    --                          table parente absente de B...) (BLOCKING)
+    -- FK_REPAIR_FAILED       : échec de réparation (désactivation/réactivation
+    --                          d'une FK de cycle côté B) (BLOCKING)
+    C_ISSUE_PARENT_BACKFILLED          CONSTANT VARCHAR2(30) := 'PARENT_BACKFILLED';
+    C_ISSUE_FK_CHILD_RETRIED           CONSTANT VARCHAR2(30) := 'FK_CHILD_RETRIED';
+    C_ISSUE_FK_CYCLE_HANDLED_BY_DISABLE CONSTANT VARCHAR2(30) := 'FK_CYCLE_HANDLED_BY_DISABLE';
+    C_ISSUE_TABLE_CREATED_IN_B         CONSTANT VARCHAR2(30) := 'TABLE_CREATED_IN_B';
+    C_ISSUE_PARENT_BACKFILL_FAILED     CONSTANT VARCHAR2(30) := 'PARENT_BACKFILL_FAILED';
+    C_ISSUE_FK_REPAIR_FAILED           CONSTANT VARCHAR2(30) := 'FK_REPAIR_FAILED';
+
+    -- Options globales de comportement du run (SYNC_RUN_OPTION)
+    -- AUTO_BACKFILL_PARENTS    : 'Y'/'N' — backfill des parents manquants (v5)
+    -- MAX_FK_RETRY             : nombre maximal de tentatives enfant après backfill
+    -- CYCLE_HANDLING           : 'DISABLE_FK' (défaut, désactiv. temporaire des FK) / 'BLOCK'
+    -- AUTO_CREATE_MISSING_TABLE: 'Y'/'N' — création automatique d'une table
+    --                            active absente de SCHEMA_B (défaut 'N')
+    C_OPT_AUTO_BACKFILL_PARENTS    CONSTANT VARCHAR2(64) := 'AUTO_BACKFILL_PARENTS';
+    C_OPT_MAX_FK_RETRY             CONSTANT VARCHAR2(64) := 'MAX_FK_RETRY';
+    C_OPT_CYCLE_HANDLING           CONSTANT VARCHAR2(64) := 'CYCLE_HANDLING';
+    C_OPT_AUTO_CREATE_MISSING_TABLE CONSTANT VARCHAR2(64) := 'AUTO_CREATE_MISSING_TABLE';
+
 
     --------------------------------------------------------------------------
     -- EXCEPTIONS PUBLIQUES
@@ -459,6 +489,28 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     PROCEDURE PURGE_HISTORY (
         p_keep_days IN NUMBER
     );
+
+    ----------------------------------------------------------------------
+    -- SET_RUN_OPTION / GET_RUN_OPTION (v5)
+    --
+    -- Lecture/écriture des options globales de comportement du run
+    -- (table SYNC_RUN_OPTION) :
+    --    AUTO_BACKFILL_PARENTS     : 'Y'/'N' — backfill des parents manquants
+    --    MAX_FK_RETRY              : nombre maximal de tentatives enfant après backfill
+    --    CYCLE_HANDLING            : 'DISABLE_FK' / 'BLOCK'
+    --    AUTO_CREATE_MISSING_TABLE : 'Y'/'N' — auto-création d'une table
+    --                                active absente de SCHEMA_B (défaut 'N')
+    --
+    -- SET_RUN_OPTION valide le nom (E_INVALID_PARAMETER sinon) mais laisse la
+    -- contrainte CK_SRO_NAME trancher les valeurs interdites. GET_RUN_OPTION
+    -- renvoie la valeur courante, ou NULL si l'option/champ est vide.
+    ----------------------------------------------------------------------
+    PROCEDURE SET_RUN_OPTION (
+        p_option_name  IN VARCHAR2,
+        p_option_value IN VARCHAR2
+    );
+
+    FUNCTION GET_RUN_OPTION (p_option_name IN VARCHAR2) RETURN VARCHAR2;
 
 END PKG_SCHEMA_SYNC;
 /
