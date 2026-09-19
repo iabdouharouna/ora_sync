@@ -16,6 +16,7 @@ __pycache__/
 .orasync/
 *.log
 logs/
+backups/
 
 # Editeurs / OS
 .idea/
