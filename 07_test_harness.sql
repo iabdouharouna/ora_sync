@@ -9,11 +9,16 @@
 -- des assertions et lève une erreur applicative à la fin si au moins une a
 -- échoué, pour un usage en CI / smoke-test.
 --
--- Non destructif : aucun DML sur les tables métier. Les seuls SYNC * lancés
--- ici sont en DRY_RUN : le diagnostic et le calcul de hachage s'exécutent
--- réellement (c'est ce qu'on valide), mais aucune écriture métier n'est
--- faite — seules les tables d'audit SYNC_* reçoivent les lignes de synthèse
--- du run (comportement normal du package).
+-- Périmètre : les Blocs 1 à 9 sont NON DESTRUCTIFS (aucun DML métier ; les
+-- SYNC * y sont en DRY_RUN : le diagnostic et le calcul de hachage
+-- s'exécutent réellement, seules les tables d'audit SYNC_* reçoivent les
+-- lignes de synthèse). Le Bloc 10 (v5) exécute lui deux SYNC_TABLE RÉELS
+-- (p_dry_run => FALSE) sur un scénario auto-réparant strictement ADDITIF
+-- (CLIENT 901 / COMMANDE 9901) : c'est le seul moyen d'exercer le backfill
+-- des parents FK, neutralisé en dry run (p_allow_ddl = NOT p_dry_run). Les
+-- lignes de scénario sont supprimées des deux côtés en fin de bloc — le
+-- moteur ne propageant jamais les suppressions, l'état initial est restauré
+-- à l'identique.
 --------------------------------------------------------------------------------
 
 SET SERVEROUTPUT ON SIZE UNLIMITED;
@@ -593,6 +598,302 @@ BEGIN
         ----------------------------------------------------
         restore_state;
         T_HARNESS.RESULT('fk_lineage_v4');
+    EXCEPTION
+        WHEN OTHERS THEN
+            BEGIN
+                restore_state;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_OUTPUT.PUT_LINE('  RESTORE partiel impossible : ' || SQLERRM);
+            END;
+            RAISE;
+    END;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Bloc 10 : (v5) auto-réparation RÉELLE (backfill des parents FK manquants)
+--
+-- Scénario auto-réparant, intégralement ré-exécutable (le harnais peut être
+-- relancé sans préparation ni nettoyage manuel) :
+--   * prérequis : les privilèges SYS d'auto-réparation (Script 09) sont
+--     effectivement accordés au compte exécutant ;
+--   * API v5    : SET_RUN_OPTION / GET_RUN_OPTION (round-trip), rejet d'une
+--     option inconnue (E_INVALID_PARAMETER, -20011) et d'une valeur interdite
+--     (validation API -20011, doublée en base par CK_SRO_VALUE), sans altérer
+--     la valeur en place ;
+--   * scénario  : un parent CLIENT absent de SCHEMA_B alors que son enfant
+--     COMMANDE existe côté A -> SYNC_TABLE RÉEL sur COMMANDE : ORA-02291
+--     intercepté, backfill du parent depuis SCHEMA_A (PARENT_BACKFILLED),
+--     retentative (FK_CHILD_RETRIED), puis insertion de l'enfant réussie ;
+--   * garanties : SYNC_TABLE ne mute ni SYNC_TABLE_CONFIG ni
+--     SYNC_COLUMN_CONFIG (empreinte inchangée) ; aucun conflit ; second run
+--     réel = 0 écriture (idempotence) et plus aucune réparation tentée ;
+--   * restauration : options remises à leur valeur d'origine, lignes de
+--     scénario supprimées des DEUX côtés (enfant d'abord, clé étrangère).
+--
+-- NB : c'est le seul bloc à exécuter des runs RÉELS — l'auto-réparation
+-- (backfill, auto-création de table) est neutralisée en dry run.
+--------------------------------------------------------------------------------
+DECLARE
+    v_opt_orig   VARCHAR2(256);
+    v_opt_flip   VARCHAR2(256);
+    v_cycle_orig VARCHAR2(256);
+    v_err        VARCHAR2(2000);
+    v_run_id     NUMBER;
+    v_run2_id    NUMBER;
+    v_start      TIMESTAMP;
+    v_status     VARCHAR2(30);
+    v_dry        CHAR(1);
+    v_cnt        NUMBER;
+    v_failed     NUMBER;
+    v_bf1        NUMBER;
+    v_retry1     NUMBER;
+    v_repair2    NUMBER;
+    v_ins2       NUMBER;
+    v_priv       NUMBER;
+    v_fp_before  NUMBER;
+    v_fp_after   NUMBER;
+
+    PROCEDURE restore_state IS
+        -- Règle : une valeur d'origine HORS PÉRIMÈTRE (persistée par une
+        -- version antérieure du package, cf. CYCLE_HANDLING='BIDON') ne doit
+        -- pas faire échouer la restauration — on retombe alors sur la valeur
+        -- par défaut de l'option.
+        FUNCTION sane_default(p_name IN VARCHAR2, p_value IN VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            IF p_value IS NULL THEN
+                RETURN NULL;
+            END IF;
+            IF p_name = 'AUTO_BACKFILL_PARENTS' AND p_value IN ('Y', 'N') THEN
+                RETURN p_value;
+            ELSIF p_name = 'CYCLE_HANDLING' AND p_value IN ('DISABLE_FK', 'BLOCK') THEN
+                RETURN p_value;
+            ELSIF p_name = 'AUTO_CREATE_MISSING_TABLE' AND p_value IN ('Y', 'N') THEN
+                RETURN p_value;
+            ELSIF p_name = 'MAX_FK_RETRY' AND REGEXP_LIKE(p_value, '^[1-9][0-9]{0,9}$') THEN
+                RETURN p_value;
+            END IF;
+            RETURN CASE p_name
+                WHEN 'AUTO_BACKFILL_PARENTS'     THEN 'Y'
+                WHEN 'AUTO_CREATE_MISSING_TABLE' THEN 'N'
+                WHEN 'CYCLE_HANDLING'            THEN 'DISABLE_FK'
+                WHEN 'MAX_FK_RETRY'              THEN '3'
+            END;
+        END sane_default;
+    BEGIN
+        -- Options restaurées à leur valeur CAPTURÉE en début de bloc (avant
+        -- toute mutation) ; en cas de processus différent, retombée sur le défaut.
+        IF v_opt_orig IS NOT NULL THEN
+            BEGIN
+                PKG_SCHEMA_SYNC.SET_RUN_OPTION('AUTO_BACKFILL_PARENTS',
+                    sane_default('AUTO_BACKFILL_PARENTS', v_opt_orig));
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_OUTPUT.PUT_LINE('  RESTORE option partiel : ' || SQLERRM);
+            END;
+        END IF;
+
+        IF v_cycle_orig IS NOT NULL THEN
+            BEGIN
+                PKG_SCHEMA_SYNC.SET_RUN_OPTION('CYCLE_HANDLING',
+                    sane_default('CYCLE_HANDLING', v_cycle_orig));
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_OUTPUT.PUT_LINE('  RESTORE CYCLE_HANDLING partiel : ' || SQLERRM);
+            END;
+        END IF;
+
+        -- Enfant d'abord (clé étrangère), puis parent, des deux côtés.
+        DELETE FROM SCHEMA_A.COMMANDE WHERE COMMANDE_ID = 9901;
+        DELETE FROM SCHEMA_B.COMMANDE WHERE COMMANDE_ID = 9901;
+        DELETE FROM SCHEMA_A.CLIENT WHERE CLIENT_ID = 901;
+        DELETE FROM SCHEMA_B.CLIENT WHERE CLIENT_ID = 901;
+        COMMIT;
+    END restore_state;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('== Bloc 10 : (v5) auto-reparation reelle (backfill) ==');
+
+    BEGIN
+        ------------------------------------------------------------
+        -- 1) Prérequis SYS et API d'options (v5)
+        ------------------------------------------------------------
+        SELECT COUNT(*) INTO v_priv
+          FROM SESSION_PRIVS
+         WHERE privilege IN ('ALTER ANY TABLE','CREATE ANY TABLE','CREATE ANY INDEX',
+                             'INSERT ANY TABLE','UPDATE ANY TABLE','DELETE ANY TABLE',
+                             'CREATE ANY TRIGGER');
+        T_HARNESS.ASSERT_TRUE('Privileges SYS auto-reparation presents (7 attendus)',
+            v_priv = 7, 'nb=' || v_priv);
+
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_RUN_OPTION
+         WHERE option_name IN ('AUTO_BACKFILL_PARENTS','MAX_FK_RETRY','CYCLE_HANDLING',
+                               'AUTO_CREATE_MISSING_TABLE');
+        T_HARNESS.ASSERT_TRUE('SYNC_RUN_OPTION : 4 options v5 presentes', v_cnt = 4, 'nb=' || v_cnt);
+
+        v_opt_orig   := PKG_SCHEMA_SYNC.GET_RUN_OPTION('AUTO_BACKFILL_PARENTS');
+        v_cycle_orig := PKG_SCHEMA_SYNC.GET_RUN_OPTION('CYCLE_HANDLING');
+        T_HARNESS.ASSERT_TRUE('GET_RUN_OPTION(AUTO_BACKFILL_PARENTS) renvoie une valeur',
+            v_opt_orig IS NOT NULL, 'val=' || NVL(v_opt_orig, '<null>'));
+
+        v_opt_flip := CASE WHEN v_opt_orig = 'Y' THEN 'N' ELSE 'Y' END;
+        PKG_SCHEMA_SYNC.SET_RUN_OPTION('AUTO_BACKFILL_PARENTS', v_opt_flip);
+        T_HARNESS.ASSERT_TRUE('SET_RUN_OPTION / GET_RUN_OPTION : round-trip coherent',
+            PKG_SCHEMA_SYNC.GET_RUN_OPTION('AUTO_BACKFILL_PARENTS') = v_opt_flip,
+            'flip=' || v_opt_flip);
+
+        -- Le scénario exige l'auto-backfill actif (valeur par défaut 'Y').
+        PKG_SCHEMA_SYNC.SET_RUN_OPTION('AUTO_BACKFILL_PARENTS', 'Y');
+        T_HARNESS.ASSERT_TRUE('AUTO_BACKFILL_PARENTS force a Y pour le scenario',
+            PKG_SCHEMA_SYNC.GET_RUN_OPTION('AUTO_BACKFILL_PARENTS') = 'Y');
+
+        BEGIN
+            PKG_SCHEMA_SYNC.SET_RUN_OPTION('OPTION_BIDON_V5', 'X');
+            v_err := NULL;
+        EXCEPTION
+            WHEN PKG_SCHEMA_SYNC.E_INVALID_PARAMETER THEN
+                v_err := SQLERRM;
+            WHEN OTHERS THEN
+                v_err := 'AUTRE_ERREUR: ' || SQLERRM;
+        END;
+        T_HARNESS.ASSERT_TRUE('Option inconnue rejetee (E_INVALID_PARAMETER -20011)',
+            v_err IS NOT NULL AND INSTR(v_err, '-20011') > 0, v_err);
+
+        BEGIN
+            PKG_SCHEMA_SYNC.SET_RUN_OPTION('CYCLE_HANDLING', 'BIDON');
+            v_err := NULL;
+        EXCEPTION
+            WHEN PKG_SCHEMA_SYNC.E_INVALID_PARAMETER THEN
+                v_err := SQLERRM;
+            WHEN OTHERS THEN
+                v_err := 'AUTRE_ERREUR: ' || SQLERRM;
+        END;
+        T_HARNESS.ASSERT_TRUE('Valeur interdite rejetee (SET_RUN_OPTION, -20011 explicite)',
+            v_err IS NOT NULL AND INSTR(v_err, '-20011') > 0, v_err);
+        T_HARNESS.ASSERT_TRUE('CYCLE_HANDLING inchange apres tentative invalide',
+            PKG_SCHEMA_SYNC.GET_RUN_OPTION('CYCLE_HANDLING') = v_cycle_orig,
+            'orig=' || NVL(v_cycle_orig, '<null>'));
+
+        ------------------------------------------------------------
+        -- 2) Scénario auto-réparant (ajoutatif, reconstruit à chaque run)
+        ------------------------------------------------------------
+        SELECT (SELECT COUNT(*) FROM SYNC_TABLE_CONFIG) * 1000000
+             + (SELECT NVL(SUM(ORA_HASH(NVL(TABLE_NAME, '') || '/' || NVL(ENABLED, '') || '/'
+                             || NVL(SYNC_DIRECTION, '') || '/' || NVL(SYNC_MODE, '') || '/'
+                             || NVL(CONFLICT_STRATEGY, '') || '/'
+                             || NVL(TO_CHAR(PRIORITY), '') || '/' || NVL(UPDATED_BY, ''))), 0)
+                  FROM SYNC_TABLE_CONFIG)
+             + (SELECT COUNT(*) * 1000
+                     + NVL(SUM(ORA_HASH(NVL(TABLE_NAME, '') || '/' || NVL(COLUMN_NAME, '') || '/'
+                             || NVL(SYNC_ENABLED, ''))), 0)
+                  FROM SYNC_COLUMN_CONFIG)
+          INTO v_fp_before
+          FROM DUAL;
+
+        INSERT INTO SCHEMA_A.CLIENT (CLIENT_ID, NOM, EMAIL)
+        SELECT 901, 'Harnais v5 auto-reparation', 'harnais.v5@example.com' FROM DUAL
+        WHERE NOT EXISTS (SELECT 1 FROM SCHEMA_A.CLIENT WHERE CLIENT_ID = 901);
+
+        INSERT INTO SCHEMA_A.COMMANDE (COMMANDE_ID, CLIENT_ID, STATUT)
+        SELECT 9901, 901, 'EN_COURS' FROM DUAL
+        WHERE NOT EXISTS (SELECT 1 FROM SCHEMA_A.COMMANDE WHERE COMMANDE_ID = 9901);
+
+        -- Etat cible : enfant et parent absents de SCHEMA_B (parent manquant).
+        DELETE FROM SCHEMA_B.COMMANDE WHERE COMMANDE_ID = 9901;
+        DELETE FROM SCHEMA_B.CLIENT WHERE CLIENT_ID = 901;
+        COMMIT;
+
+        ------------------------------------------------------------
+        -- 3) Run RÉEL 1 : ORA-02291 -> backfill -> retentative
+        ------------------------------------------------------------
+        PKG_SCHEMA_SYNC.SYNC_TABLE('COMMANDE', p_dry_run => FALSE, p_run_id => v_run_id);
+        T_HARNESS.ASSERT_TRUE('Run reel 1 : SYNC_TABLE execute sans erreur',
+            v_run_id IS NOT NULL);
+
+        SELECT status, start_date, dry_run INTO v_status, v_start, v_dry
+          FROM SYNC_RUN_HEADER WHERE run_id = v_run_id;
+        T_HARNESS.ASSERT_TRUE('Run reel 1 : statut coherent (pas FAILED)',
+            v_status IN ('SUCCESS', 'SUCCESS_WITH_CONFLICTS'), 'status=' || v_status);
+        T_HARNESS.ASSERT_TRUE('Run reel 1 : DRY_RUN = N (execution reelle)',
+            v_dry = 'N', 'dry=' || v_dry);
+
+        SELECT COUNT(*), NVL(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0)
+          INTO v_cnt, v_failed
+          FROM SYNC_LOG WHERE run_id = v_run_id AND table_name = 'COMMANDE';
+        T_HARNESS.ASSERT_TRUE('Run reel 1 : table COMMANDE non FAILED (pas d''ORA-02291)',
+            v_cnt = 1 AND v_failed = 0, 'rows=' || v_cnt || ' failed=' || v_failed);
+
+        SELECT COUNT(*) INTO v_bf1 FROM SYNC_COMPATIBILITY_REPORT
+         WHERE check_date >= v_start AND issue_type = 'PARENT_BACKFILLED';
+        T_HARNESS.ASSERT_TRUE('PARENT_BACKFILLED emis (backfill du parent CLIENT)',
+            v_bf1 >= 1, 'nb=' || v_bf1);
+
+        SELECT COUNT(*) INTO v_retry1 FROM SYNC_COMPATIBILITY_REPORT
+         WHERE check_date >= v_start AND issue_type = 'FK_CHILD_RETRIED';
+        T_HARNESS.ASSERT_TRUE('FK_CHILD_RETRIED emis (retentative apres backfill)',
+            v_retry1 >= 1, 'nb=' || v_retry1);
+
+        SELECT COUNT(*) INTO v_cnt FROM SCHEMA_B.CLIENT WHERE CLIENT_ID = 901;
+        T_HARNESS.ASSERT_TRUE('Parent CLIENT 901 repare (reinsere) dans SCHEMA_B',
+            v_cnt = 1, 'nb=' || v_cnt);
+
+        SELECT COUNT(*) INTO v_cnt FROM SCHEMA_B.COMMANDE WHERE COMMANDE_ID = 9901;
+        T_HARNESS.ASSERT_TRUE('Enfant COMMANDE 9901 insere dans SCHEMA_B',
+            v_cnt = 1, 'nb=' || v_cnt);
+
+        SELECT COUNT(*) INTO v_cnt FROM SYNC_CONFLICT WHERE run_id = v_run_id;
+        T_HARNESS.ASSERT_TRUE('Aucun conflit journalise sur le run reel',
+            v_cnt = 0, 'nb=' || v_cnt);
+
+        SELECT (SELECT COUNT(*) FROM SYNC_TABLE_CONFIG) * 1000000
+             + (SELECT NVL(SUM(ORA_HASH(NVL(TABLE_NAME, '') || '/' || NVL(ENABLED, '') || '/'
+                             || NVL(SYNC_DIRECTION, '') || '/' || NVL(SYNC_MODE, '') || '/'
+                             || NVL(CONFLICT_STRATEGY, '') || '/'
+                             || NVL(TO_CHAR(PRIORITY), '') || '/' || NVL(UPDATED_BY, ''))), 0)
+                  FROM SYNC_TABLE_CONFIG)
+             + (SELECT COUNT(*) * 1000
+                     + NVL(SUM(ORA_HASH(NVL(TABLE_NAME, '') || '/' || NVL(COLUMN_NAME, '') || '/'
+                             || NVL(SYNC_ENABLED, ''))), 0)
+                  FROM SYNC_COLUMN_CONFIG)
+          INTO v_fp_after
+          FROM DUAL;
+        T_HARNESS.ASSERT_TRUE('Configuration non mutee (empreinte SYNC_*_CONFIG inchangee)',
+            v_fp_after = v_fp_before, 'av=' || v_fp_before || ' ap=' || v_fp_after);
+
+        ------------------------------------------------------------
+        -- 4) Run RÉEL 2 : idempotence (0 écriture, plus rien à réparer)
+        ------------------------------------------------------------
+        PKG_SCHEMA_SYNC.SYNC_TABLE('COMMANDE', p_dry_run => FALSE, p_run_id => v_run2_id);
+
+        SELECT status INTO v_status FROM SYNC_RUN_HEADER WHERE run_id = v_run2_id;
+        T_HARNESS.ASSERT_TRUE('Run reel 2 : statut coherent (pas FAILED)',
+            v_status IN ('SUCCESS', 'SUCCESS_WITH_CONFLICTS'), 'status=' || v_status);
+
+        SELECT rows_inserted_a_to_b + rows_inserted_b_to_a
+             + rows_updated_a_to_b + rows_updated_b_to_a
+          INTO v_ins2
+          FROM SYNC_LOG WHERE run_id = v_run2_id AND table_name = 'COMMANDE';
+        T_HARNESS.ASSERT_TRUE('Run 2 idempotent : aucune ecriture sur COMMANDE',
+            v_ins2 = 0, 'ecritures=' || v_ins2);
+
+        SELECT start_date INTO v_start FROM SYNC_RUN_HEADER WHERE run_id = v_run2_id;
+        SELECT COUNT(*) INTO v_repair2 FROM SYNC_COMPATIBILITY_REPORT
+         WHERE check_date >= v_start
+           AND issue_type IN ('PARENT_BACKFILLED', 'FK_CHILD_RETRIED');
+        T_HARNESS.ASSERT_TRUE('Run 2 : plus aucune reparation (backfill/retry nuls)',
+            v_repair2 = 0, 'nb=' || v_repair2);
+
+        SELECT (SELECT COUNT(*) FROM SCHEMA_B.CLIENT WHERE CLIENT_ID = 901)
+             + (SELECT COUNT(*) FROM SCHEMA_B.COMMANDE WHERE COMMANDE_ID = 9901)
+          INTO v_cnt FROM DUAL;
+        T_HARNESS.ASSERT_TRUE('Pas de doublon : CLIENT 901 + COMMANDE 9901 en B',
+            v_cnt = 2, 'nb=' || v_cnt);
+
+        ------------------------------------------------------------
+        -- 5) Restauration complète (options + lignes de scénario)
+        ------------------------------------------------------------
+        restore_state;
+        T_HARNESS.RESULT('auto_repair_v5');
     EXCEPTION
         WHEN OTHERS THEN
             BEGIN

@@ -1,6 +1,6 @@
 --------------------------------------------------------------------------------
 -- SCRIPT 8 — MIGRATION V2 (pour installations issues des Scripts 1 à 6 déjà
---              déployées, ex. SYNC_ADMIN@freepdb1)
+--              déployées, ex. SYNC_ADMIN@TPWCPROPRY)
 --
 -- A exécuter dans SYNC_ADMIN, AVANT de recompiler le package (Script 4) et
 -- les tests (Scripts 6/7). Idempotent : peut être relancé sans dommage.
@@ -33,31 +33,58 @@
 SET SERVEROUTPUT ON SIZE UNLIMITED;
 
 --------------------------------------------------------------------------------
--- 1. CK_SCR_ISSUE_TYPE : contrainte au périmètre v2
+-- 1. CK_SCR_ISSUE_TYPE : contrainte au périmètre v4
+--
+-- Idempotence renforcée (correctif v5.1) : la contrainte n'est reconstruite
+-- que si elle existe SANS couvrir déjà le périmètre v4. Une contrainte déjà
+-- élargie (installation neuve Script 2 au périmètre v5, ou migration 10 déjà
+-- appliquée) est laissée intacte — la reconstruire au seul périmètre v4 la
+-- RÉTRÉCIRAIT, et son ajout échouerait (ORA-02293) dès que la table contient
+-- des lignes v5 (issues d'un run réel auto-réparant), la laissant supprimée.
+-- En cas d'ORA-02293 résiduel, la contrainte est recréée au périmètre v5 par
+-- la migration 10 en fin de séquence (cf. commande `migrate` : 08 puis 10).
 --------------------------------------------------------------------------------
 DECLARE
-    v_cnt NUMBER;
+    v_cnt  NUMBER;
+    v_wide NUMBER;
 BEGIN
     SELECT COUNT(*) INTO v_cnt
     FROM all_constraints
     WHERE owner = USER AND constraint_name = 'CK_SCR_ISSUE_TYPE';
 
-    IF v_cnt > 0 THEN
-        EXECUTE IMMEDIATE 'ALTER TABLE SYNC_COMPATIBILITY_REPORT DROP CONSTRAINT CK_SCR_ISSUE_TYPE';
-        DBMS_OUTPUT.PUT_LINE('CK_SCR_ISSUE_TYPE : ancienne contrainte supprimee.');
+    SELECT COUNT(*) INTO v_wide
+    FROM all_constraints
+    WHERE owner = USER AND constraint_name = 'CK_SCR_ISSUE_TYPE'
+      AND search_condition_vc LIKE '%FK_PARENT_ENROLLED%';
+
+    IF v_wide > 0 THEN
+        DBMS_OUTPUT.PUT_LINE('CK_SCR_ISSUE_TYPE : deja au perimetre v4+, aucune action.');
+    ELSE
+        IF v_cnt > 0 THEN
+            EXECUTE IMMEDIATE 'ALTER TABLE SYNC_COMPATIBILITY_REPORT DROP CONSTRAINT CK_SCR_ISSUE_TYPE';
+            DBMS_OUTPUT.PUT_LINE('CK_SCR_ISSUE_TYPE : ancienne contrainte supprimee.');
+        END IF;
+
+        BEGIN
+            EXECUTE IMMEDIATE 'ALTER TABLE SYNC_COMPATIBILITY_REPORT ADD CONSTRAINT CK_SCR_ISSUE_TYPE CHECK (ISSUE_TYPE IN (
+                ''MISSING_IN_A'',''MISSING_IN_B'',''TYPE_MISMATCH'',''LENGTH_MISMATCH'',
+                ''NULLABLE_MISMATCH'',''PK_MISSING'',''PK_MISMATCH'',''UNSUPPORTED_TYPE'',
+                ''KEY_NOT_UNIQUE'',''FK_CYCLE_DEFERRABLE'',''FK_CYCLE_NOT_DEFERRABLE'',
+                ''FK_PARENT_ENROLLED'',''FK_PARENT_DISABLED''
+            ))';
+            DBMS_OUTPUT.PUT_LINE('=> 1. CK_SCR_ISSUE_TYPE mise a jour (perimetre v4 : FK_PARENT_ENROLLED/FK_PARENT_DISABLED).');
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE = -2293 THEN
+                    DBMS_OUTPUT.PUT_LINE('=> 1. CK_SCR_ISSUE_TYPE : donnees v5 deja presentes, perimetre v4 refuse - ' ||
+                                         'contrainte creee au perimetre v5 par la migration 10.');
+                ELSE
+                    RAISE;
+                END IF;
+        END;
     END IF;
 END;
 /
-
-ALTER TABLE SYNC_COMPATIBILITY_REPORT
-    ADD CONSTRAINT CK_SCR_ISSUE_TYPE CHECK (ISSUE_TYPE IN (
-        'MISSING_IN_A','MISSING_IN_B','TYPE_MISMATCH','LENGTH_MISMATCH',
-        'NULLABLE_MISMATCH','PK_MISSING','PK_MISMATCH','UNSUPPORTED_TYPE',
-        'KEY_NOT_UNIQUE','FK_CYCLE_DEFERRABLE','FK_CYCLE_NOT_DEFERRABLE',
-        'FK_PARENT_ENROLLED','FK_PARENT_DISABLED'
-    ));
-
-PROMPT => 1. CK_SCR_ISSUE_TYPE mise a jour (perimetre v4 : FK_PARENT_ENROLLED/FK_PARENT_DISABLED).
 
 
 --------------------------------------------------------------------------------

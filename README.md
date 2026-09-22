@@ -6,7 +6,7 @@
 
 Architecture générique, bidirectionnelle, idempotente, configurable, auditable et performante de synchronisation de données Oracle entre deux schémas via DB LINK.
 
-**Version 4.0 — Document de spécifications** (correctifs et durcissements v2, évolutions v3, enrôlement de la lignée FK en v4 — cf. [§7](#7-changelog-v2), [§8](#8-changelog-v3) et [§9](#9-changelog-v4))
+**Version 5.0 — Document de spécifications** (correctifs et durcissements v2, évolutions v3, enrôlement de la lignée FK en v4, auto-réparation ascendante en v5 — cf. [§7](#7-changelog-v2), [§8](#8-changelog-v3), [§9](#9-changelog-v4) et [§10](#10-changelog-v5))
 
 ---
 
@@ -135,7 +135,7 @@ Avant toute synchronisation, le package compare les métadonnées des tables ent
 - **BLOCKING** : la table est automatiquement exclue du run tant que l'anomalie n'est pas corrigée (ex. table absente d'un côté, type ou longueur incompatible sur une colonne synchronisée, absence de clé exploitable, clé configurée non unique en pratique, clés A/B divergentes).
 - **WARNING** : la table reste synchronisable, l'anomalie est seulement signalée (ex. colonne surnuméraire exclue de fait, nullabilité différente, absence de clé déclarée côté B alors que A en a une).
 
-Typologie des anomalies journalisées (`SYNC_COMPATIBILITY_REPORT.ISSUE_TYPE`) : `MISSING_IN_A`, `MISSING_IN_B`, `TYPE_MISMATCH`, `LENGTH_MISMATCH`, `NULLABLE_MISMATCH`, `PK_MISSING`, `PK_MISMATCH`, `UNSUPPORTED_TYPE`, `KEY_NOT_UNIQUE`, `FK_CYCLE_DEFERRABLE`, `FK_CYCLE_NOT_DEFERRABLE`, `FK_PARENT_ENROLLED`, `FK_PARENT_DISABLED`. Les deux `FK_CYCLE_*` portent sur les cycles FK (cf. [§4.5](#45-ordonnancement-des-écritures-dépendances-fk)) ; `PK_MISMATCH` (correctif v2) compare les clés de correspondance réellement retenues des deux côtés (`WARNING` si B n'a aucune clé détectable, `BLOCKING` si les clés diffèrent). Les deux `FK_PARENT_*` (v4) portent sur la lignée FK hors périmètre configuré (cf. [§3.9](#39-périmètre-par-liste-de-tables-et-expansion-implicite-des-dépendances-fk)) : `FK_PARENT_ENROLLED` signale un parent FK absent de `SYNC_TABLE_CONFIG` **enrôlé automatiquement** avec sa lignée (`WARNING`) ; `FK_PARENT_DISABLED` signale un parent présent mais désactivé (`ENABLED='N'` ou `SYNC_DIRECTION='DISABLED'`), **jamais forcé** (`WARNING`).
+Typologie des anomalies journalisées (`SYNC_COMPATIBILITY_REPORT.ISSUE_TYPE`) : `MISSING_IN_A`, `MISSING_IN_B`, `TYPE_MISMATCH`, `LENGTH_MISMATCH`, `NULLABLE_MISMATCH`, `PK_MISSING`, `PK_MISMATCH`, `UNSUPPORTED_TYPE`, `KEY_NOT_UNIQUE`, `FK_CYCLE_DEFERRABLE`, `FK_CYCLE_NOT_DEFERRABLE`, `FK_PARENT_ENROLLED`, `FK_PARENT_DISABLED`. Les deux `FK_CYCLE_*` portent sur les cycles FK (cf. [§4.5](#45-ordonnancement-des-écritures-dépendances-fk)) ; `PK_MISMATCH` (correctif v2) compare les clés de correspondance réellement retenues des deux côtés (`WARNING` si B n'a aucune clé détectable, `BLOCKING` si les clés diffèrent). Les deux `FK_PARENT_*` (v4) portent sur la lignée FK hors périmètre configuré (cf. [§3.9](#39-périmètre-par-liste-de-tables-et-expansion-implicite-des-dépendances-fk)) : `FK_PARENT_ENROLLED` signale un parent FK absent de `SYNC_TABLE_CONFIG` **enrôlé automatiquement** avec sa lignée (`WARNING`) ; `FK_PARENT_DISABLED` signale un parent présent mais désactivé (`ENABLED='N'` ou `SYNC_DIRECTION='DISABLED'`), **jamais forcé** (`WARNING`). Les six types v5 (`PARENT_BACKFILLED`, `FK_CHILD_RETRIED`, `FK_CYCLE_HANDLED_BY_DISABLE`, `TABLE_CREATED_IN_B`, `PARENT_BACKFILL_FAILED`, `FK_REPAIR_FAILED`) tracent l'auto-réparation ascendante : backfill des parents FK manquants et retentative enfant (`PARENT_BACKFILLED`/`FK_CHILD_RETRIED`, `WARNING`), traitement des cycles FK par désactivation (`FK_CYCLE_HANDLED_BY_DISABLE`, `WARNING`), auto-création des tables manquantes en B (`TABLE_CREATED_IN_B`, `WARNING`), et leurs échecs éventuels (`PARENT_BACKFILL_FAILED`, `FK_REPAIR_FAILED`, `BLOCKING`) — cf. [§10](#10-changelog-v5).
 
 ### 3.6. Mode simulation (DRY_RUN)
 
@@ -266,6 +266,10 @@ PKG_SCHEMA_SYNC.GET_RUN_STATUS(
 PKG_SCHEMA_SYNC.SET_DB_LINK(p_db_link IN VARCHAR2);
 PKG_SCHEMA_SYNC.GET_DB_LINK RETURN VARCHAR2;
 PKG_SCHEMA_SYNC.PURGE_HISTORY(p_keep_days IN NUMBER);
+
+-- Options globales de run (v5)
+PKG_SCHEMA_SYNC.SET_RUN_OPTION(p_option_name IN VARCHAR2, p_option_value IN VARCHAR2);
+PKG_SCHEMA_SYNC.GET_RUN_OPTION(p_option_name IN VARCHAR2) RETURN VARCHAR2;
 ```
 
 Les schémas A et B ne sont pas des paramètres d'appel : ils sont fixés par des constantes de package (`C_SCHEMA_A`, `C_SCHEMA_B`, `C_DB_LINK_B`), pour éviter qu'un appelant ne redirige accidentellement la synchronisation.
@@ -275,6 +279,8 @@ La cible distante (`p_db_link`, ajouté en v2) peut être surchargée à l'exéc
 `SYNC_TABLES(p_table_list, ...)` (v3) synchronise une liste de tables en étendant automatiquement le périmètre aux parents FK nécessaires (cf. § 3.9). Le type public `t_tab_name_list` s'utilise par exemple : `PKG_SCHEMA_SYNC.SYNC_TABLES(p_table_list => PKG_SCHEMA_SYNC.t_tab_name_list('COMMANDE_LIGNE'));`
 
 `PURGE_HISTORY(p_keep_days)` (implémenté en v2) purge les tables d'audit à croissance illimitée : `SYNC_CONFLICT` (base `RESOLVED_DATE`), `SYNC_COMPATIBILITY_REPORT` (base `CHECK_DATE`), puis `SYNC_LOG`/`SYNC_RUN_HEADER` (base `START_DATE`, l'en-tête n'étant supprimé que si plus aucun log ne s'y rattache). `p_keep_days <= 0` est refusé : une purge totale doit rester une décision explicite hors du mode de maintenance.
+
+`SET_RUN_OPTION`/`GET_RUN_OPTION` (v5) pilotent les options globales de run stockées dans `SYNC_RUN_OPTION` : `AUTO_BACKFILL_PARENTS` (`Y`/`N`, défaut `Y`), `AUTO_CREATE_MISSING_TABLE` (`Y`/`N`, défaut `N`), `CYCLE_HANDLING` (`DISABLE_FK`/`BLOCK`, défaut `BLOCK`) et `MAX_FK_RETRY` (entier positif, défaut `3`). Le nom **et** la valeur sont validés avant toute persistance (`E_INVALID_PARAMETER`, `-20011`), contrôles doublés en base par `CK_SRO_NAME` (noms) et `CK_SRO_VALUE` (valeurs, « défense en profondeur ») — cf. [§10](#10-changelog-v5).
 
 > **Point d'attention** — `SYNC_TABLE` ne traite que la table demandée, jamais le reste de sa grappe de dépendances FK. Si la table appartient à une grappe de plusieurs tables, cela peut introduire une incohérence référentielle transitoire. À réserver aux rattrapages ciblés ; préférer `SYNC_ALL` (grappe complète) ou `SYNC_TABLES` (périmètre étendu aux parents FK) pour un traitement cohérent.
 
@@ -380,7 +386,7 @@ Cette section consolide, en un seul endroit, l'ensemble des limites et risques s
 | 8 | Le choix d'éviter tout MERGE vers une cible distante (INSERT+UPDATE à la place) est un choix pris par l'architecte pour des raisons de portabilité, non explicitement validé par le commanditaire. | À confirmer |
 | 9 | Le code n'a pas été compilé ni exécuté contre une instance Oracle réelle au moment de sa livraison ; une phase de compilation et de correction des éventuelles erreurs de syntaxe est indispensable avant toute utilisation. | Levée en v2 (cf. note ci-dessous) |
 
-> **Note de mise à jour** — La limite n° 9 a été levée : le code a depuis été intégré dans `04_sync_package_body.sql`, compilé sur une instance Oracle réelle (`SYNC_ADMIN@freepdb1`, Oracle 23.26) et validé fonctionnellement (dry-run et run réel). Le package est actuellement `VALID`, 0 erreur. La v2 est couverte par le harnais automatisé `07_test_harness.sql` (toutes sections PASS) et par le jeu de scénarios `06_test_scenarios.sql`.
+> **Note de mise à jour (v5.1)** — La limite n° 9 a été levée : le code a depuis été intégré dans `03_sync_package_spec.sql`/`04_sync_package_body.sql`, compilé sur une instance Oracle réelle (`SYNC_ADMIN@172.16.5.124:1521/TPWCPROPRY`, Oracle 19.16) et validé fonctionnellement (dry-run et runs réels, dont l'auto-réparation v5). Le package est actuellement `VALID`, 0 objet `INVALID`. La v2 → v5.1 est couverte par le harnais automatisé `07_test_harness.sql` (10 sections, 72 assertions, toutes PASS — dont le Bloc 10 : runs `SYNC_TABLE` RÉELS auto-réparants) et par le jeu de scénarios `06_test_scenarios.sql`.
 
 ---
 
@@ -407,11 +413,11 @@ Ce document de spécifications accompagne les livrables techniques suivants, pro
 - **Script 4** — Corps du package (`CREATE PACKAGE BODY`)
 - **Script 5** — Tables métier d'exemple, données et configuration (+ prérequis `GRANT EXECUTE ON DBMS_CRYPTO`)
 - **Script 6** — Jeu de tests fonctionnels guidés (18 scénarios)
-- **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL, non destructif)
+- **Script 7** — Harnais de validation automatisée (assertions PASS/FAIL ; Blocs 1→10 : découverte, paramètres, modes, migration, et — à partir du Bloc 9 (v4) — mutations **réelles auto-nettoyées** : enrôlement de lignée FK persisté puis restauré, runs `SYNC_TABLE` réels avec backfill)
 - **Script 8** — Migration v1 → v2/v3 (idempotente : contraintes, colonne `PK_HASH_KEY` élargie, GTT, `SYNC_MODE` / `RUN_TYPE`)
-- **Script 9** — Démonstration des modes de synchronisation (`INSERT`, `UPDATE`, `INSERT_UPDATE` et mode par table), avec remise à l'état initial (optionnel)
+- **Script 9 (démo)** — `09_test_sync_mode.sql` : démonstration manuelle des modes de synchronisation (`INSERT`, `UPDATE`, `INSERT_UPDATE` et mode par table), avec remise à l'état initial (optionnel)
 - **Script 10** — Migration v4 → v5 (idempotente : auto-réparation des FK parents absents / cycles / auto-création de tables manquantes, table `SYNC_RUN_OPTION`, `CHECK` de `SYNC_COMPATIBILITY_REPORT` élargi)
-- **Prérequis SYS (une fois)** — `09_sys_auto_repair_grants.sql` : octroi idempotent, avec le profil `sys`, des privilèges système nécessaires à l'auto-réparation v5 (ALTER / CREATE ANY TABLE / INDEX, INSERT / UPDATE / DELETE ANY TABLE) — à exécuter **avant** le Script 8/10 côté `admin` (cf. [§11.3](#113-commandes))
+- **Script 9 (grants SYS)** — `09_sys_auto_repair_grants.sql` : octroi idempotent, avec le profil `sys` (SYSDBA), des privilèges système nécessaires à l'auto-réparation v5 (ALTER / CREATE ANY TABLE / INDEX, CREATE ANY TRIGGER) — à exécuter **avant** le Script 8/10 côté `admin` (cf. [§11.3](#113-commandes))
 - **Outillage** — `setup_project.py` + package `tools/orasync` (déploiement, tests et diagnostic en ligne de commande, cf. [§11](#11-outillage-de-déploiement-et-industrialisation))
 
 ---
@@ -458,17 +464,17 @@ Récapitulatif des correctifs et durcissements apportés en v2 par rapport au do
 
 ## 10. Changelog v5
 
-Enrichissements fonctionnels apportés en v5 (auto-réparation ascendante) :
+Enrichissements fonctionnels apportés en v5 (auto-réparation ascendante), et correctifs v5.1 :
 
-- **Auto-réparation des parents FK absents** — nouvelle fonctionnalité : les parents FK absents (clôture transitive côté `SCHEMA_A`) sont **créés/réparés automatiquement** (profil `AUTO_FK_REPAIR`, direction **héritée de l'enfant**, statut `FK_PARENT_REPAIRED`) — idempotent, persistant (`COMMIT`) sans muter `SYNC_TABLE_CONFIG`.
-- **Auto-réparation des cycles FK** — les cycles (parents absents en cycle) sont détectés et traités sans échec (`FK_CYCLE_REPAIRED` / `CYCLE_BROKEN`), avec désactivation temporaire idempotente du FK de cycle côté `B`.
-- **Auto-création de tables manquantes** — les tables de `B` absentes structurellement (périmètre par liste / `SYNC_TABLES`) sont **créées automatiquement** (profil `AUTO_TABLE_CREATION`, statut `TABLE_CREATED_IN_B`) sans modification de `SYNC_TABLE_CONFIG`.
-- **`SYNC_RUN_OPTION`** — nouvelle table de configuration des options globales de run (`AUTO_FK_REPAIR`, `CYCLE_HANDLING`, `AUTO_TABLE_CREATION`), créée par le Script 10 (idempotent).
-- **`CHECK` de `SYNC_COMPATIBILITY_REPORT` élargi** — le `CHECK` de `SYNC_COMPATIBILITY_REPORT` accepte les statuts v5 (`FK_PARENT_REPAIRED`, `FK_CYCLE_REPAIRED`, `TABLE_CREATED_IN_B`) — Script 10 idempotent, aligné sur le Script 2 (installation neuve).
-- **Prérequis SYS (une fois)** — `09_sys_auto_repair_grants.sql` octroie, avec le profil `sys` (SYSDBA), les privilèges nécessaires à l'auto-réparation v5 (`ALTER / CREATE ANY TABLE / INDEX`, `INSERT / UPDATE / DELETE ANY TABLE`) — à exécuter avant le Script 8/10 côté `admin` (cf. [§11.3](#113-commandes)).
-- **Tests** — harnais Script 7 étendu d'un Bloc 10 (10 sections) : scénario auto-réparant — `SYNC_TABLE` non mutant, enrôlement + direction héritée, profil `AUTO_FK_REPAIR`, `FK_PARENT_DISABLED` sans forçage, idempotence d'un second contrôle, run `SYNC_TABLES` post-réparation sans `FAILED`. Validation attendue : run réel `SYNC_TABLES` post-auto-réparation en ordre topologique garantissant l'absence d'`ORA-02291`.
-
----
+- **Backfill des parents FK absents** — si l'insertion A→B d'un enfant échoue sur `ORA-02291` (parent absent de `SCHEMA_B`), le run ré-insère automatiquement le parent depuis `SCHEMA_A` (copie des colonnes synchronisées, issue `PARENT_BACKFILLED`, `WARNING`), puis retente l'enfant — jusqu'à `MAX_FK_RETRY` tentatives (issue `FK_CHILD_RETRIED`, `WARNING`). Piloté par l'option `AUTO_BACKFILL_PARENTS` (`Y`/`N`, défaut `Y`). Un échec du backfill (`PARENT_BACKFILL_FAILED`, `BLOCKING`) ou la saturation des tentatives laisse la table en `FAILED` (comportement historique préservé avec `AUTO_BACKFILL_PARENTS='N'`).
+- **Cycles FK** — option `CYCLE_HANDLING` : `BLOCK` (défaut : exclusion de la grappe en cycle non déferrable, comportement historique) ou `DISABLE_FK` : désactivation temporaire idempotente du FK de cycle côté `SCHEMA_B` pour permettre le traitement (issue `FK_CYCLE_HANDLED_BY_DISABLE`, `WARNING`) ; un échec est tracé en `FK_REPAIR_FAILED` (`BLOCKING`).
+- **Auto-création des tables manquantes** — option `AUTO_CREATE_MISSING_TABLE` (`Y`/`N`, défaut `N`) : une table active absente de `SCHEMA_B` est créée automatiquement lors d'un run RÉEL (`p_dry_run=FALSE` ; neutralisée en dry run), issue `TABLE_CREATED_IN_B` (`WARNING`).
+- **`SYNC_RUN_OPTION`** — table des options globales de run (`AUTO_BACKFILL_PARENTS`, `MAX_FK_RETRY`, `CYCLE_HANDLING`, `AUTO_CREATE_MISSING_TABLE`), créée par le Script 10 (idempotent), lue via `GET_RUN_OPTION` et modifiée via `SET_RUN_OPTION` (API publique, cf. [§4.3](#43-api-publique)).
+- **Validation des options (correctif v5.1)** — `SET_RUN_OPTION` valide désormais le nom **et** la valeur (`E_INVALID_PARAMETER`, `-20011`) ; la contrainte `CK_SRO_VALUE` applique la même règle en base (« défense en profondeur ») ; la migration 10 répare idempotemment toute valeur hors périmètre persistée par une version antérieure (ex. `CYCLE_HANDLING='BIDON'`).
+- **Correctif backfill (v5.1)** — le SQL de backfill passait le préfixe d'alias de la clé enfante avec son point final (`'ch.'`), produisant `ch..<colonne>` (`ORA-01747`) avalé silencieusement : le backfill rendait 0 ligne et le run échouait en `ORA-02291` sans trace exploitable. Corrigé (préfixe sans point) et validé par le Bloc 10 du harnais (run réel auto-réparant).
+- **`CHECK` de `SYNC_COMPATIBILITY_REPORT` élargi** — les issue types v5 (`PARENT_BACKFILLED`, `FK_CHILD_RETRIED`, `FK_CYCLE_HANDLED_BY_DISABLE`, `TABLE_CREATED_IN_B`, `PARENT_BACKFILL_FAILED`, `FK_REPAIR_FAILED`) sont acceptés — Script 10 idempotent, aligné sur le Script 2 (installation neuve).
+- **Prérequis SYS (une fois)** — `09_sys_auto_repair_grants.sql` octroie, avec le profil `sys` (SYSDBA), les privilèges nécessaires à l'auto-réparation v5 (`ALTER ANY TABLE`, `CREATE ANY TABLE`, `CREATE ANY INDEX`, `CREATE ANY TRIGGER`) — à exécuter avant le Script 10 côté `admin` (cf. [§11.3](#113-commandes)).
+- **Tests** — harnais Script 7 étendu d'un Bloc 10 (10 sections, 72 assertions au total) : round-trip `SET_RUN_OPTION`/`GET_RUN_OPTION`, rejet d'une option inconnue et d'une valeur interdite (`-20011` explicite) sans altérer la valeur en place, run `SYNC_TABLE` RÉEL (dry=`FALSE`) avec backfill du parent (`PARENT_BACKFILLED` + `FK_CHILD_RETRIED`) puis insertion enfant réussie, second run réel idempotent (0 écriture, 0 réparation), restauration complète (options + lignes de scénario).
 
 ---
 
@@ -506,6 +512,7 @@ Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automati
 | `test` | Exécute le harnais de validation (Script 7) | `admin` |
 | `setup [--with-sample] [--run-tests]` | Enchaîne `install` [+ `sample`] [+ `test`] | selon étape |
 | `sql <fichier> [--profile P] [--continue-on-error]` | Exécute un script SQL\*Plus arbitraire | `admin` par défaut |
+| `sql 09_sys_auto_repair_grants.sql --profile sys` | Octroi idempotent des privilèges SYS d'auto-réparation v5 (une fois, **avant** `install`/`migrate`) | `sys` |
 | `status [--limit N]` | Affiche les dernières exécutions (`SYNC_RUN_HEADER`) | `admin` |
 
 Options globales : `--env-file`, `-v`/`-vv` (verbosité), `--dry-run` (affiche les actions sans exécuter les scripts).

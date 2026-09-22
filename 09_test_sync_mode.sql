@@ -8,8 +8,8 @@
 --              UPDATE        : seules les MISES A JOUR sont propagees
 --              INSERT_UPDATE : creations ET mises a jour (defaut)
 --
--- A executer connecte en SYNC_ADMIN sur FREEPDB1 :
---   sqlplus SYNC_ADMIN/<mot_de_passe>@localhost:1521/FREEPDB1
+-- A executer connecte en SYNC_ADMIN sur l'instance cible (cf. DSN du .env) :
+--   sqlplus SYNC_ADMIN/<mot_de_passe>@<hote>:<port>/<service>
 --   SQL> @09_test_sync_mode.sql
 --
 -- Prerequis : le paquet PKG_SCHEMA_SYNC doit etre compile (Scripts 3/4) et le

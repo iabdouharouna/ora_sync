@@ -1,4 +1,3 @@
-SPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED
 SET LINESIZE 200
 SET PAGESIZE 1000
@@ -54,4 +53,4 @@ PROMPT ==>
 
 COMMIT;
 
-EXIT
+PROMPT => Fin du script 09 (grants SYS) - privileges d'auto-reparation octroyes.

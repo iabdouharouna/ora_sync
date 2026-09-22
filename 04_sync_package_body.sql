@@ -2557,7 +2557,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             'SELECT ' || v_all_cols || ' FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || sanitize_ident(v_parent) || ' p ' ||
             'WHERE EXISTS (SELECT 1 FROM ' || sanitize_ident(C_SCHEMA_A) || '.' || sanitize_ident(p_child_table) || ' ch ' ||
             '   WHERE ' || v_pair ||
-            '     AND ' || build_key_expr_aliased(v_child_key, 'ch.', v_child_types) ||
+            '     AND ' || build_key_expr_aliased(v_child_key, 'ch', v_child_types) ||
             ' IN (SELECT pk_hash_key FROM SYNC_WORK_DIFF WHERE run_id = :rid AND table_name = :ct ' ||
             '     AND diff_type = ''INSERT_TO_B'')) ' ||
             ' AND NOT EXISTS (SELECT 1 FROM ' || b_table_ref(v_parent) || ' bp WHERE ' ||
@@ -4096,15 +4096,41 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     -- SET_RUN_OPTION  (procédure publique, v5)
     ----------------------------------------------------------------------
     PROCEDURE SET_RUN_OPTION (p_option_name IN VARCHAR2, p_option_value IN VARCHAR2) IS
-        v_name VARCHAR2(64) := UPPER(TRIM(p_option_name));
+        v_name  VARCHAR2(64)  := UPPER(TRIM(p_option_name));
+        v_value VARCHAR2(256) := TRIM(p_option_value);
     BEGIN
         IF v_name NOT IN (C_OPT_AUTO_BACKFILL_PARENTS, C_OPT_MAX_FK_RETRY,
                           C_OPT_CYCLE_HANDLING, C_OPT_AUTO_CREATE_MISSING_TABLE) THEN
             RAISE E_INVALID_PARAMETER;
         END IF;
 
+        -- Correctif v5.1 : validation des VALEURS en dur (la contrainte
+        -- CK_SRO_VALUE applique la même règle en base pour toute écriture qui
+        -- contournerait l'API — "défense en profondeur"). Sans cela, une valeur
+        -- quelconque (ex. 'BIDON') était persistée silencieusement et neutralisait
+        -- l'option à l'exécution sans alerter l'opérateur.
+        IF v_name IN (C_OPT_AUTO_BACKFILL_PARENTS, C_OPT_AUTO_CREATE_MISSING_TABLE) THEN
+            IF v_value NOT IN ('Y', 'N') THEN
+                RAISE_APPLICATION_ERROR(-20011,
+                    'Valeur interdite pour l''option ' || v_name || ' : [' || v_value
+                    || '] (attendu : Y ou N)');
+            END IF;
+        ELSIF v_name = C_OPT_CYCLE_HANDLING THEN
+            IF v_value NOT IN ('DISABLE_FK', 'BLOCK') THEN
+                RAISE_APPLICATION_ERROR(-20011,
+                    'Valeur interdite pour l''option ' || v_name || ' : [' || v_value
+                    || '] (attendu : DISABLE_FK ou BLOCK)');
+            END IF;
+        ELSE  -- C_OPT_MAX_FK_RETRY
+            IF NOT REGEXP_LIKE(v_value, '^[1-9][0-9]{0,9}$') THEN
+                RAISE_APPLICATION_ERROR(-20011,
+                    'Valeur interdite pour l''option ' || v_name || ' : [' || v_value
+                    || '] (attendu : entier positif)');
+            END IF;
+        END IF;
+
         MERGE INTO SYNC_RUN_OPTION t
-        USING (SELECT v_name AS option_name, p_option_value AS option_value FROM DUAL) s
+        USING (SELECT v_name AS option_name, v_value AS option_value FROM DUAL) s
         ON (t.option_name = s.option_name)
         WHEN MATCHED THEN UPDATE SET option_value = s.option_value,
                                      updated_date = SYSTIMESTAMP, updated_by = USER
@@ -4112,7 +4138,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             VALUES (s.option_name, s.option_value, USER);
 
         COMMIT;
-        DBMS_OUTPUT.PUT_LINE('SET_RUN_OPTION : ' || v_name || ' = ' || p_option_value);
+        DBMS_OUTPUT.PUT_LINE('SET_RUN_OPTION : ' || v_name || ' = ' || v_value);
     END SET_RUN_OPTION;
 
 

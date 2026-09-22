@@ -62,7 +62,7 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- nouveau — comportement voulu (le configurer une fois, pas à chaque
     -- appel), mais à garder en tête dans ce cas de figure.
     -- INSTALLATION COURANTE : SCHEMA_A, SCHEMA_B et SYNC_ADMIN sont colocalisés
-    -- sur UNE MÊME instance (TPWCPRO) -> C_DB_LINK_B = NULL (mode "même
+    -- sur UNE MÊME instance (TPWCPROPRY) -> C_DB_LINK_B = NULL (mode "même
     -- instance" décrit ci-dessus, aucun suffixe '@...', aucune transaction
     -- distribuée). Remettre 'SYNC_LINK_B' (ou tout autre nom de lien) exige
     -- une ré-compilation consciente si les deux schémas étaient séparés.
@@ -521,9 +521,13 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --    AUTO_CREATE_MISSING_TABLE : 'Y'/'N' — auto-création d'une table
     --                                active absente de SCHEMA_B (défaut 'N')
     --
-    -- SET_RUN_OPTION valide le nom (E_INVALID_PARAMETER sinon) mais laisse la
-    -- contrainte CK_SRO_NAME trancher les valeurs interdites. GET_RUN_OPTION
-    -- renvoie la valeur courante, ou NULL si l'option/champ est vide.
+    -- SET_RUN_OPTION valide le nom ET la valeur (E_INVALID_PARAMETER sinon) :
+    --      AUTO_BACKFILL_PARENTS / AUTO_CREATE_MISSING_TABLE : 'Y' ou 'N'
+    --      CYCLE_HANDLING  : 'DISABLE_FK' ou 'BLOCK'
+    --      MAX_FK_RETRY    : entier positif (1..9999999999)
+    -- La contrainte CK_SRO_VALUE applique la même règle en base ("défense en
+    -- profondeur"). GET_RUN_OPTION renvoie la valeur courante, ou NULL si
+    -- l'option/champ est vide.
     ----------------------------------------------------------------------
     PROCEDURE SET_RUN_OPTION (
         p_option_name  IN VARCHAR2,
