@@ -26,7 +26,9 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 
 > **Procédure opérationnelle** : pour configurer et lancer une synchronisation
 > d'une liste de tables (scripts étape par étape), voir
-> [`11_PROCEDURE_SYNCHRONISATION.md`](11_PROCEDURE_SYNCHRONISATION.md).
+> [`11_PROCEDURE_SYNCHRONISATION.md`](11_PROCEDURE_SYNCHRONISATION.md) ;
+> pour une exécution « tout-en-un » paramétrable, voir
+> [`12_SYNC_UNE_LISTE.sql`](12_SYNC_UNE_LISTE.sql).
 
 ---
 

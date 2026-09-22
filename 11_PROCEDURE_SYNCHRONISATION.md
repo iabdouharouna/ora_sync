@@ -459,6 +459,38 @@ ALTER SEQUENCE SYNC_COMPAT_CHECK_ID_SEQ RESTART START WITH 1;
 > sont pas des données d'historique.
 
 --------------------------------------------------------------------------------
+## 9. Approche « fichier unique paramétrable »
+
+Pour un besoin simple et rapide (configurer + lancer + vérifier une liste de
+tables en un seul geste), le script **`12_SYNC_UNE_LISTE.sql`** regroupe les
+Étapes 1 à 7 dans UN fichier : section `PARAMÈTRES` à éditer en tête
+(liste des tables, schémas A/B, direction, mode, dry-seul, exclusions de
+colonnes), puis découverte, configuration idempotente, contrôle de
+compatibilité, dry run, run réel (si `c_dry_seul='N'`) et vérification des
+volumes.
+
+```sql
+-- Lancement (les paramètres sont à éditer au début du bloc PL/SQL) :
+--   python setup_project.py sql 12_SYNC_UNE_LISTE.sql
+```
+
+Points clés :
+- **dry run par défaut** : `c_dry_seul = 'Y'` (rien n'est écrit sur les tables
+  métier) ; passer à `'N'` après validation du dry run pour lancer le réel.
+- **idempotent** : la configuration déjà posée n'est jamais écrasée
+  (INSERT conditionnels `NOT EXISTS`) — le fichier peut être relancé sans
+  risque.
+- **garde d'environnement** : le script s'arrête proprement
+  (`RAISE_APPLICATION_ERROR`) si les constantes compilées du package ne
+  correspondent pas à `c_schema_a`/`c_schema_b`, ou si le package n'est pas
+  `VALID`.
+- `SYNC_TABLES` étant appelé sur la liste, la **lignée FK** est résolue
+  automatiquement : les parents/ancêtres sont enrôlés en config et les tables
+  de la même grappe FK sont traitées ensemble (exemple réel : un run demandant
+  3 tables a traité la grappe complète de 20 tables, avec 1 parent
+  `MISSING_IN_B` exclu — comportement attendu).
+
+--------------------------------------------------------------------------------
 ## Annexe A — Rappel de l'API publique (`03_sync_package_spec.sql`)
 
 | Procédure / fonction | Rôle |
@@ -483,6 +515,8 @@ ALTER SEQUENCE SYNC_COMPAT_CHECK_ID_SEQ RESTART START WITH 1;
 | `05_sample_data_and_config.sql` | données + config d'exemple (CLIENT/PRODUIT/COMMANDE) |
 | `06_test_scenarios.sql`, `07_test_harness.sql` | scénarios et harnais 72 assertions |
 | `08_migration_v2.sql`, `09_*` | migrations et grants (SYS) |
+| `11_PROCEDURE_SYNCHRONISATION.md` | procédure opérationnelle (ce document) |
+| `12_SYNC_UNE_LISTE.sql` | **fichier unique paramétrable** : config + dry run (+ réel) + vérifs pour une liste de tables (§9) |
 | `tools/orasync/` | CLI `setup_project.py` (`check`, `install`, `migrate`, `sql`, `sample`, `test`, `status`) |
 
 ## Annexe C — Patch temporaire des constantes `C_SCHEMA_A/B` (schémas ≠ compilés)
