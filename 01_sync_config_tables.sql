@@ -241,10 +241,24 @@ CREATE TABLE SYNC_RUN_OPTION (
 COMMENT ON TABLE SYNC_RUN_OPTION IS
     'Options globales de comportement du run (auto-reparation FK, cycles, auto-creation).';
 
-INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('AUTO_BACKFILL_PARENTS', 'Y', 'SYNC_ADMIN');
-INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('MAX_FK_RETRY',          '3', 'SYNC_ADMIN');
-INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('CYCLE_HANDLING',        'DISABLE_FK', 'SYNC_ADMIN');
-INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by) VALUES ('AUTO_CREATE_MISSING_TABLE', 'N', 'SYNC_ADMIN');
+-- Idempotence : chaque valeur par défaut n'est insérée QUE si l'option est
+-- absente — un re-déploiement (install/migrate) ne doit jamais réinitialiser
+-- un réglage d'exploitation déjà personnalisé.
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by)
+SELECT 'AUTO_BACKFILL_PARENTS', 'Y', 'SYNC_ADMIN' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM SYNC_RUN_OPTION WHERE option_name = 'AUTO_BACKFILL_PARENTS');
+
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by)
+SELECT 'MAX_FK_RETRY', '3', 'SYNC_ADMIN' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM SYNC_RUN_OPTION WHERE option_name = 'MAX_FK_RETRY');
+
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by)
+SELECT 'CYCLE_HANDLING', 'DISABLE_FK', 'SYNC_ADMIN' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM SYNC_RUN_OPTION WHERE option_name = 'CYCLE_HANDLING');
+
+INSERT INTO SYNC_RUN_OPTION (option_name, option_value, updated_by)
+SELECT 'AUTO_CREATE_MISSING_TABLE', 'N', 'SYNC_ADMIN' FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM SYNC_RUN_OPTION WHERE option_name = 'AUTO_CREATE_MISSING_TABLE');
 
 
 --------------------------------------------------------------------------------

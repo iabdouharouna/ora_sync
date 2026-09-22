@@ -947,21 +947,33 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --------------------------------------------------------------------------
     -- exec_ddl_at_b (privée, v5)
     --
-    -- Rôle : exécuter un DDL côté SCHEMA_B, localement (même instance) ou via
-    --        le DB LINK. Un DDL ne peut pas être expédié tel quel sur un lien :
-    --        on enrobe la commande dans un bloc anonyme exécuté A DISTANCE
-    --        (EXECUTE IMMEDIATE ... AT), ce qui l'exécute dans la session
-    --        distante du compte du lien — technique fiable, indépendante de la
-    --        présence du privilège sur l'instance locale.
-    -- Contrainte : le compte exécutant doit disposer du privilège requis côté
-    --        SCHEMA_B (ex. ALTER ANY TABLE pour désactiver une FK).
+    -- Rôle : exécuter un DDL côté SCHEMA_B.
+    --
+    --   * Mode MÊME INSTANCE (g_db_link_b IS NULL, cas de cette installation) :
+    --     le DDL est exécuté localement, le nom de table étant déjà qualifié
+    --     SCHEMA_B.<table> par l'appelant (cf. b_ddl_table_ref / v_tbl_ref).
+    --     Le compte exécutant (SYNC_ADMIN) doit disposer des privilèges
+    --     requis sur SCHEMA_B (CREATE / ALTER ANY TABLE, cf. script SYS
+    --     09_sys_auto_repair_grants.sql).
+    --
+    --   * Mode DEUX INSTANCES (g_db_link_b IS NOT NULL) : LIMITE CONNUE,
+    --     erreur explicite E_REMOTE_DDL_UNSUPPORTED (-20012).
+    --     Un DDL ne peut pas traverser un DB LINK en PL/SQL natif :
+    --       - EXECUTE IMMEDIATE ne dispose d'aucune clause "AT <lien>"
+    --         (syntaxe documentée en 19c comme en 21c : dynamic_sql_stmt,
+    --         INTO, USING, RETURNING uniquement) ;
+    --       - aucun mécanisme Oracle standard ne permet d'émettre du DDL dans
+    --         la session distante d'un compte de lien depuis PL/SQL.
+    --     La levée est faite AVANT toute exécution : jamais de DDL partiel.
+    --     Contournement : passer C_DB_LINK_B / SET_DB_LINK à NULL (même
+    --     instance), où l'auto-réparation v5 fonctionne intégralement.
     --------------------------------------------------------------------------
     PROCEDURE exec_ddl_at_b(p_ddl IN VARCHAR2) IS
     BEGIN
         IF g_db_link_b IS NULL THEN
             EXECUTE IMMEDIATE p_ddl;
         ELSE
-            EXECUTE IMMEDIATE 'BEGIN EXECUTE IMMEDIATE :ddl; END;' AT g_db_link_b USING p_ddl;
+            RAISE E_REMOTE_DDL_UNSUPPORTED;
         END IF;
     END exec_ddl_at_b;
 
@@ -1051,7 +1063,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             v_tbl_ref := sanitize_ident(p_table_name);
         END IF;
 
-        v_attempted := TRUE;
         exec_ddl_at_b('CREATE TABLE ' || v_tbl_ref || ' (' || v_col_specs || ')');
 
         -- Contrainte PRIMARY KEY, si la table source en a une. Un échec
@@ -2421,6 +2432,16 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --      peut être neutralisée (colonnes NULL) plutôt que de déclencher un
     --      backfill ; le champ deferrable dit si la contrainte peut être
     --      contournée par SET CONSTRAINTS ALL DEFERRED dans un run.
+    -- NB (correctif de compilation) : la jointure porte sur ALL_TAB_COLUMNS,
+    --      qui ne expose QUE les colonnes visibles (les colonnes masquées ne
+    --      sont listées que par ALL_TAB_COLS, seule vue à porter une colonne
+    --      HIDDEN). Le predicat "cols.hidden = 'NO'" référençait donc une
+    --      colonne inexistante ici (ORA-00904 / PLS-00302) : il est retiré,
+    --      la sémantique "colonnes visibles" étant déjà celle de la vue.
+    -- NB (correctif de compilation, idem) : ALL_CONSTRAINTS ne porte pas de
+    --      colonne DELETED non plus (ORA-00904) — le predicat "c.deleted =
+    --      'NO'" est retiré ; "c.status = 'ENABLED'" filtre déjà les
+    --      contraintes actives.
     --------------------------------------------------------------------------
     FUNCTION fk_parent_refs(p_child_table IN VARCHAR2) RETURN t_fk_ref_tab IS
         v_result t_fk_ref_tab;
@@ -2448,9 +2469,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
               AND c.constraint_type = 'R'
               AND c.table_name = p_child_table
               AND c.status = 'ENABLED'
-              AND c.deleted = 'NO'
               AND pc.owner = C_SCHEMA_A
-              AND cols.hidden = 'NO'
             ORDER BY c.constraint_name, chi.position
         ) LOOP
             IF v_result.COUNT = 0 OR v_result(v_result.COUNT).constraint_name != r.constraint_name THEN

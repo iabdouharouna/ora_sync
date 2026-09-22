@@ -82,7 +82,9 @@ BEGIN
 END;
 /
 
--- Valeurs par défaut (upsert, sans écraser un réglage existant).
+-- Valeurs par défaut (idempotent : uniquement les options MANQUANTES sont
+-- ajoutées ; un réglage d'exploitation existant n'est jamais écrasé par un
+-- re-déploiement — cf. l'intention "sans écraser un réglage existant").
 MERGE INTO SYNC_RUN_OPTION t
 USING (
     SELECT 'AUTO_BACKFILL_PARENTS'  AS option_name, 'Y'          AS option_value FROM DUAL UNION ALL
@@ -91,7 +93,6 @@ USING (
     SELECT 'AUTO_CREATE_MISSING_TABLE' AS option_name, 'N'       AS option_value FROM DUAL
 ) s
 ON (t.option_name = s.option_name)
-WHEN MATCHED THEN UPDATE SET option_value = s.option_value, updated_date = SYSTIMESTAMP, updated_by = 'SYNC_ADMIN'
 WHEN NOT MATCHED THEN INSERT (option_name, option_value, updated_by)
     VALUES (s.option_name, s.option_value, 'SYNC_ADMIN');
 

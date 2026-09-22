@@ -55,16 +55,18 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check", help="verifie les connexions Oracle", parents=[common])
 
     install = sub.add_parser(
-        "install", help="cree les tables et le package", parents=[common]
+        "install", help="tables, migrations puis package (compile en dernier)", parents=[common]
     )
     install.add_argument(
         "--no-migrate",
         action="store_true",
-        help="ne pas appliquer la migration 08 apres la creation",
+        help="ne pas appliquer les migrations 08/10 apres la creation des tables",
     )
 
     sub.add_parser(
-        "migrate", help="applique les migrations idempotentes 08 puis 10", parents=[common]
+        "migrate",
+        help="migrations idempotentes 08/10, puis recompile spec + corps",
+        parents=[common],
     )
 
     sample = sub.add_parser(

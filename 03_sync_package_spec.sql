@@ -61,7 +61,15 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- appels suivants dans la MEME session tant qu'il n'est pas changé à
     -- nouveau — comportement voulu (le configurer une fois, pas à chaque
     -- appel), mais à garder en tête dans ce cas de figure.
-    C_DB_LINK_B         CONSTANT VARCHAR2(128) := 'SYNC_LINK_B';  -- ou NULL si même instance
+    -- INSTALLATION COURANTE : SCHEMA_A, SCHEMA_B et SYNC_ADMIN sont colocalisés
+    -- sur UNE MÊME instance (TPWCPRO) -> C_DB_LINK_B = NULL (mode "même
+    -- instance" décrit ci-dessus, aucun suffixe '@...', aucune transaction
+    -- distribuée). Remettre 'SYNC_LINK_B' (ou tout autre nom de lien) exige
+    -- une ré-compilation consciente si les deux schémas étaient séparés.
+    -- NB : ne PAS utiliser ici le DB LINK PUBLIC SYNC_LINK_B existant sur
+    -- l'instance, qui est un lien partagé rattaché à un AUTRE compte
+    -- (PCARDIMPFE) et n'a aucun rapport avec SCHEMA_B.
+    C_DB_LINK_B         CONSTANT VARCHAR2(128) := NULL;  -- NULL = même instance
 
     -- Sentinelle utilisée comme valeur par défaut du paramètre p_db_link de
     -- SYNC_ALL / SYNC_TABLE / CHECK_COMPATIBILITY. Nécessaire car NULL a déjà
@@ -215,6 +223,18 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- p_db_link non vide mais ne passant pas DBMS_ASSERT, p_keep_days <= 0...).
     E_INVALID_PARAMETER           EXCEPTION;
     PRAGMA EXCEPTION_INIT (E_INVALID_PARAMETER, -20011);
+
+    -- DDL à distance non supporté (v5, limite connue) : l'auto-réparation
+    -- (auto-création d'une table dans SCHEMA_B, désactivation/réactivation
+    -- d'une FK de cycle) exécute du DDL côté SCHEMA_B. Or un DDL ne peut pas
+    -- traverser un DB LINK en PL/SQL natif : EXECUTE IMMEDIATE ne dispose
+    -- d'aucune clause "AT <lien>" (syntaxe introuvable en 19c comme en 21c),
+    -- et aucun mécanisme Oracle standard ne le permet. La branche distante
+    -- de exec_ddl_at_b lève donc cette erreur, sans jamais exécuter partiellement
+    -- le DDL. En pratique : passez C_DB_LINK_B / SET_DB_LINK à NULL (mode même
+    -- instance), où l'auto-réparation fonctionne intégralement.
+    E_REMOTE_DDL_UNSUPPORTED      EXCEPTION;
+    PRAGMA EXCEPTION_INIT (E_REMOTE_DDL_UNSUPPORTED, -20012);
 
 
     --------------------------------------------------------------------------

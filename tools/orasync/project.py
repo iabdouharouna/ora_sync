@@ -25,12 +25,26 @@ class ScriptSpec:
         return settings.script_path(self.filename)
 
 
-CORE_SCRIPTS: tuple[ScriptSpec, ...] = (
+# Scripts de CREATION DU SCHEMA (tables, sequences, indexes) — exécutés en
+# premier : les migrations (DDL sur ces mêmes tables) en dépendent.
+SCHEMA_SCRIPTS: tuple[ScriptSpec, ...] = (
     ScriptSpec("01_sync_config_tables.sql", "admin", "Tables de configuration"),
     ScriptSpec("02_sync_log_tables.sql", "admin", "Tables de journalisation"),
+)
+
+# Scripts du PACKAGE (specification puis corps) — exécutés EN DERNIER, après
+# les migrations : un DDL de migration (DROP/CREATE de contrainte, recreation
+# de GTT...) invalide le package, dont la revalidation est alors DIFFÉRÉE
+# (aucune erreur USER_ERRORS, mais STATUT = INVALID jusqu'au premier appel).
+# Or le harnais 07 (Bloc 1) contrôle le STATUT avant tout appel : compiler le
+# package avant les migrations faisait échouer "test" juste après "install".
+PACKAGE_SCRIPTS: tuple[ScriptSpec, ...] = (
     ScriptSpec("03_sync_package_spec.sql", "admin", "Specification du package"),
     ScriptSpec("04_sync_package_body.sql", "admin", "Corps du package"),
 )
+
+# Ensemble "schema + package", tel que vu par l'iterateur de scripts.
+CORE_SCRIPTS: tuple[ScriptSpec, ...] = SCHEMA_SCRIPTS + PACKAGE_SCRIPTS
 
 MIGRATION_SCRIPTS = (
     ScriptSpec("08_migration_v2.sql", "admin", "Migration idempotente v1 -> v2/v3"),
@@ -113,9 +127,13 @@ def run_scripts(
 def install_core(
     settings: Settings, *, with_migration: bool = True, dry_run: bool = False
 ) -> RunStats:
-    scripts: list[ScriptSpec] = list(CORE_SCRIPTS)
+    # Ordre immuable : SCHEMA (01,02) -> MIGRATIONS (08,10) -> PACKAGE (03,04).
+    # Le package est compilé APRÈS les migrations, seuls garants d'un STATUT
+    # VALID en fin d'installation (cf. commentaire PACKAGE_SCRIPTS).
+    scripts: list[ScriptSpec] = list(SCHEMA_SCRIPTS)
     if with_migration:
         scripts.extend(MIGRATION_SCRIPTS)
+    scripts.extend(PACKAGE_SCRIPTS)
     return run_scripts(
         settings,
         "admin",
@@ -126,10 +144,13 @@ def install_core(
 
 
 def migrate(settings: Settings, *, dry_run: bool = False) -> RunStats:
+    # Les migrations sont du DDL sur des tables référencées par le package :
+    # on recompile systématiquement spec + corps juste après, sinon le package
+    # reste INVALID (révalidation différée) jusqu'au premier appel.
     return run_scripts(
         settings,
         "admin",
-        [*MIGRATION_SCRIPTS],
+        [*MIGRATION_SCRIPTS, *PACKAGE_SCRIPTS],
         tolerate_idempotent_errors=True,
         dry_run=dry_run,
     )

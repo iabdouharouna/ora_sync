@@ -500,8 +500,8 @@ Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automati
 | Commande | Rôle | Profil(s) utilisé(s) |
 |----------|------|----------------------|
 | `check` | Teste chaque connexion et affiche version/utilisateur | tous |
-| `install [--no-migrate]` | Crée les tables et le package (Scripts 1→4 puis 8 et 10 idempotents) | `admin` |
-| `migrate` | Applique les migrations idempotentes (Scripts 8 et 10) | `admin` |
+| `install [--no-migrate]` | Crée les tables (Scripts 1→2), applique les migrations idempotentes (8 et 10), puis compile le package (Scripts 3→4) — le package est compilé **en dernier**, les migrations (DDL) l'invalidant sinon | `admin` |
+| `migrate` | Applique les migrations idempotentes (Scripts 8 et 10) puis recompile la spécification et le corps (3→4) | `admin` |
 | `sample [--link-user X]` | Charge données et configuration d'exemple (Script 5, sections A/B/CONFIG) | `schema_a`, `schema_b`, `admin` |
 | `test` | Exécute le harnais de validation (Script 7) | `admin` |
 | `setup [--with-sample] [--run-tests]` | Enchaîne `install` [+ `sample`] [+ `test`] | selon étape |
