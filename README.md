@@ -24,6 +24,10 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 10. [Changelog v5](#10-changelog-v5)
 11. [Outillage de déploiement et industrialisation](#11-outillage-de-déploiement-et-industrialisation)
 
+> **Procédure opérationnelle** : pour configurer et lancer une synchronisation
+> d'une liste de tables (scripts étape par étape), voir
+> [`11_PROCEDURE_SYNCHRONISATION.md`](11_PROCEDURE_SYNCHRONISATION.md).
+
 ---
 
 ## 1. Introduction et contexte
