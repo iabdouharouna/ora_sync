@@ -3390,6 +3390,46 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
 
     --------------------------------------------------------------------------
+    -- fk_exists_at_b (privée, v5.3)
+    --
+    -- Rôle : indiquer si une contrainte FK donnée existe EFFECTIVEMENT côté
+    --        SCHEMA_B (même table, même nom, type 'R'). Sert au disable des
+    --        cycles FK : quand le graphe de contraintes diverge entre A et B
+    --        (FK présente côté A, absente côté B — scénario réel observé sur
+    --        deux bases jumelles dont l'une a évolué), tenter le
+    --        ALTER ... DISABLE CONSTRAINT lèverait ORA-02431 ("no such
+    --        constraint") et, par le repli all-or-nothing des grappes
+    --        cycliques, ferait exclure TOUTE la grappe de 30+ tables pour
+    --        une contrainte qui n'existe pas côté B.
+    -- Sécurité : une FK absente de B ne peut PAS violer d'INSERT côté B
+    --        (aucune contrainte à vérifier) : ignorer sa désactivation est
+    --        donc sans risque pour l'intégrité de B.
+    -- Limite : comme exec_ddl_at_b, n'est utilisable qu'en mode "même
+    --        instance" (g_db_link_b IS NULL) ; sinon on renvoie TRUE pour
+    --        préserver le comportement historique (lèvement de
+    --        E_REMOTE_DDL_UNSUPPORTED au premier DDL plutôt qu'un skip
+    --        silencieux).
+    --------------------------------------------------------------------------
+    FUNCTION fk_exists_at_b(
+        p_table_name      IN VARCHAR2,
+        p_constraint_name IN VARCHAR2
+    ) RETURN BOOLEAN IS
+        v_count PLS_INTEGER;
+    BEGIN
+        IF g_db_link_b IS NOT NULL THEN
+            RETURN TRUE;
+        END IF;
+        SELECT COUNT(*) INTO v_count
+        FROM ALL_CONSTRAINTS
+        WHERE owner          = C_SCHEMA_B
+          AND table_name     = p_table_name
+          AND constraint_name = p_constraint_name
+          AND constraint_type = 'R';
+        RETURN v_count > 0;
+    END fk_exists_at_b;
+
+
+    --------------------------------------------------------------------------
     -- disable_cluster_fks / enable_cluster_fks (privées, v5)
     --
     -- Rôle : désactiver (respectivement réactiver), côté SCHEMA_B, les
@@ -3437,6 +3477,18 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
 
                     v_token := p_cluster_tables(i).table_name || '|' || v_refs(r).constraint_name;
                     IF is_in_list(v_token, v_done) THEN
+                        CONTINUE;
+                    END IF;
+
+                    -- v5.3 : FK présente en A mais absente de B (graphe FK
+                    -- divergent entre les deux bases) : rien à désactiver
+                    -- côté B. Sauter est sans risque — aucun INSERT ne peut
+                    -- violer une contrainte inexistante — et évite un
+                    -- ORA-02431 qui, par le repli all-or-nothing des grappes
+                    -- cycliques, ferait exclure TOUTE la grappe en BLOCKING.
+                    IF NOT fk_exists_at_b(p_cluster_tables(i).table_name, v_refs(r).constraint_name) THEN
+                        DBMS_OUTPUT.PUT_LINE('disable_cluster_fks : FK ' || v_refs(r).constraint_name
+                            || ' absente de ' || C_SCHEMA_B || ' (graphe FK divergent), ignoree');
                         CONTINUE;
                     END IF;
 
