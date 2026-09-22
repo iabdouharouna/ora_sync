@@ -2956,10 +2956,17 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END IF;
 
         ------------------------------------------------------------------
-        -- 2) Conflits candidats : résolution ENSEMBLISTE. La règle est
-        --    constante par table (direction ou stratégie de conflit) :
-        --    une seule décision s'applique à toutes les lignes
-        --    CONFLICT_CANDIDATE, plus aucune itération ligne à ligne.
+        -- 2) Conflits candidats : JOURNALISATION SYNC_CONFLICT puis
+        --    résolution ENSEMBLISTE. La règle est constante par table
+        --    (direction ou stratégie de conflit) : une seule décision
+        --    s'applique à toutes les lignes CONFLICT_CANDIDATE, plus
+        --    aucune itération ligne à ligne.
+        --    Ordre impératif (fix v5.2) : log_conflicts_for_table doit
+        --    être appelé AVANT la conversion ci-dessous, car il filtre
+        --    les lignes encore en 'CONFLICT_CANDIDATE' (snapshot des deux
+        --    côtés au diagnostic) ; après la conversion, plus aucune ligne
+        --    ne matcherait et SYNC_CONFLICT resterait vide (conflict_count
+        --    systématiquement nul, dry runs masquant les vrais conflits).
         ------------------------------------------------------------------
         IF v_direction = C_DIRECTION_A_TO_B THEN
                 v_final_diff_type := 'UPDATE_TO_B';
@@ -2992,14 +2999,18 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                 v_resolved_side := NULL;
             END IF;
 
+            -- Journalisation de TOUS les candidats (résolus ou non) avec la
+            -- stratégie et le côté retenus : traçabilité systématique, y
+            -- compris les écarts forcés d'une direction unique (DIRECTION_FORCED
+            -- ne pèse pas dans conflict_count, cf. process_one_table).
+            log_conflicts_for_table(p_run_id, p_table_name, p_key_cols,
+                                    v_resolution_strategy, v_resolved_side);
+
             -- Décision unique pour TOUTES les lignes de la table (la règle de
             -- résolution est constante par table) : application ensembliste.
             UPDATE SYNC_WORK_DIFF
             SET diff_type = v_final_diff_type, direction = v_final_direction
             WHERE run_id = p_run_id AND table_name = p_table_name AND diff_type = 'CONFLICT_CANDIDATE';
-
-            log_conflicts_for_table(p_run_id, p_table_name, p_key_cols,
-                                    v_resolution_strategy, v_resolved_side);
     END resolve_table_diffs;
 
     ----------------------------------------------------------------------
