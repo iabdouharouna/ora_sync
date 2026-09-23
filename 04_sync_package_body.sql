@@ -4094,6 +4094,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
     --        ne dépend encore d'eux (le run en cours d'un autre run résiduel
     --        n'est jamais cassé). Correctif v2 : automatisé, alors que le
     --        Script 2 signalait simplement cette purge comme "à prévoir".
+    --        Depuis la v6, les rapports d'état d'écart (SYNC_STATS_GAP et son
+    --        détail SYNC_STATS_GAP_DETAIL) sont purgés eux aussi sur le même
+    --        critère d'âge (COLLECT_DATE) — le détail (FK) d'abord.
     ----------------------------------------------------------------------
     PROCEDURE PURGE_HISTORY (
         p_keep_days IN NUMBER
@@ -4103,6 +4106,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_compat    NUMBER := 0;
         v_log       NUMBER := 0;
         v_header    NUMBER := 0;
+        v_gap_det   NUMBER := 0;
+        v_gap       NUMBER := 0;
     BEGIN
         IF p_keep_days IS NULL OR p_keep_days <= 0 THEN
             RAISE_APPLICATION_ERROR(-20011,
@@ -4126,8 +4131,17 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
           AND NOT EXISTS (SELECT 1 FROM SYNC_LOG l WHERE l.run_id = h.run_id);
         v_header := SQL%ROWCOUNT;
 
+        DELETE FROM SYNC_STATS_GAP_DETAIL d
+        WHERE EXISTS (SELECT 1 FROM SYNC_STATS_GAP h
+                       WHERE h.gap_id = d.gap_id AND h.collect_date < v_cutoff);
+        v_gap_det := SQL%ROWCOUNT;
+
+        DELETE FROM SYNC_STATS_GAP WHERE collect_date < v_cutoff;
+        v_gap := SQL%ROWCOUNT;
+
         DBMS_OUTPUT.PUT_LINE('PURGE_HISTORY(' || p_keep_days || ') - enregistrements supprimes : conflicts=' 
-            || v_conflict || ', compatibility=' || v_compat || ', logs=' || v_log || ', headers=' || v_header);
+            || v_conflict || ', compatibility=' || v_compat || ', logs=' || v_log || ', headers=' || v_header
+            || ', gap_details=' || v_gap_det || ', gaps=' || v_gap);
     END PURGE_HISTORY;
 
 
@@ -4221,6 +4235,429 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         END;
         RETURN v_value;
     END GET_RUN_OPTION;
+
+
+    ----------------------------------------------------------------------
+    -- SECTION « ÉTAT D'ÉCART SCHÉMA (STATS) » — v6
+    --
+    -- L'écart de volumétrie A/B repose sur les statistiques Oracle (niveau
+    -- table : ALL_TAB_STATISTICS, object_type='TABLE' et partition_name IS
+    -- NULL, soit les stats GLOBALES d'une table, partitionnée ou non). Ces
+    -- stats sont supposées FRAÎCHES : la collecte explicite (jobs décrits
+    -- plus bas) est un préalable assumé du workflow — lire des stats
+    -- anciennes fausserait le diagnostic. NUM_ROWS reste une ESTIMATION de
+    -- l'optimiseur (limite documentée de la v1).
+    --
+    -- Côté lecture, le schéma B peut être distant (DB LINK) : les vues du
+    -- dictionnaire sont alors lues via le DB LINK (@g_db_link_b). Côté
+    -- collecte, en revanche, la v1 ne supporte que le mode « même instance »
+    -- (SUBMIT_STATS_JOBS refuse un C_DB_LINK_B renseigné) : un job local ne
+    -- peut pas exécuter de bloc PL/SQL à travers un DB LINK — dans un
+    -- déploiement multi-instances, la collecte du schéma B doit être lancée
+    -- dans la session de suivi de B (même ordonnancement, hors pic).
+    ----------------------------------------------------------------------
+
+    ----------------------------------------------------------------------
+    -- SUBMIT_STATS_JOBS  (procédure publique, v6)
+    ----------------------------------------------------------------------
+    PROCEDURE SUBMIT_STATS_JOBS (
+        p_schema_a      IN  VARCHAR2 DEFAULT C_SCHEMA_A,
+        p_schema_b      IN  VARCHAR2 DEFAULT C_SCHEMA_B,
+        p_job_name_a    OUT VARCHAR2,
+        p_job_name_b    OUT VARCHAR2
+    ) IS
+        v_schema_a VARCHAR2(128);
+        v_schema_b VARCHAR2(128);
+        v_cnt      NUMBER;
+        v_action_a VARCHAR2(4000);
+        v_action_b VARCHAR2(4000);
+    BEGIN
+        v_schema_a := sanitize_ident(UPPER(TRIM(p_schema_a)));
+        v_schema_b := sanitize_ident(UPPER(TRIM(p_schema_b)));
+
+        IF g_db_link_b IS NOT NULL THEN
+            -- v1 : la collecte se fait DANS l'instance de chaque schéma ; un
+            -- job DBMS_SCHEDULER local ne peut pas exécuter de bloc PL/SQL à
+            -- travers un DB LINK. La lecture du rapport, elle, sait le faire
+            -- (vues du dictionnaire lues via @g_db_link_b).
+            RAISE_APPLICATION_ERROR(-20014,
+                'SUBMIT_STATS_JOBS : collecte distante via DB LINK non supportee en v1. ' ||
+                'Lancer manuellement DBMS_STATS.GATHER_SCHEMA_STATS sur le schema ' ||
+                v_schema_b || ' dans son instance, puis REPORT_COUNTS_GAP.');
+        END IF;
+
+        v_action_a := 'BEGIN DBMS_STATS.GATHER_SCHEMA_STATS(' ||
+                      'ownname => ''' || v_schema_a || ''', options => ''GATHER''); END;';
+        v_action_b := 'BEGIN DBMS_STATS.GATHER_SCHEMA_STATS(' ||
+                      'ownname => ''' || v_schema_b || ''', options => ''GATHER''); END;';
+
+        -- Job côté A : créé s'il n'existe plus (auto_drop => TRUE), puis
+        -- lancé immédiatement en arrière-plan (asynchrone).
+        SELECT COUNT(*) INTO v_cnt
+          FROM USER_SCHEDULER_JOBS
+         WHERE job_name = 'SYNC_STATS_A';
+        IF v_cnt = 0 THEN
+            DBMS_SCHEDULER.CREATE_JOB(
+                job_name   => 'SYNC_STATS_A',
+                job_type   => 'PLSQL_BLOCK',
+                job_action => v_action_a,
+                enabled    => FALSE,   -- lancé explicitement ci-dessous
+                auto_drop  => TRUE     -- le job disparaît après exécution
+            );
+        END IF;
+        DBMS_SCHEDULER.RUN_JOB('SYNC_STATS_A', use_current_session => FALSE);
+        p_job_name_a := 'SYNC_STATS_A';
+
+        -- Job côté B : idem (mode « même instance » exigé ci-dessus).
+        SELECT COUNT(*) INTO v_cnt
+          FROM USER_SCHEDULER_JOBS
+         WHERE job_name = 'SYNC_STATS_B';
+        IF v_cnt = 0 THEN
+            DBMS_SCHEDULER.CREATE_JOB(
+                job_name   => 'SYNC_STATS_B',
+                job_type   => 'PLSQL_BLOCK',
+                job_action => v_action_b,
+                enabled    => FALSE,
+                auto_drop  => TRUE
+            );
+        END IF;
+        DBMS_SCHEDULER.RUN_JOB('SYNC_STATS_B', use_current_session => FALSE);
+        p_job_name_b := 'SYNC_STATS_B';
+
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('SUBMIT_STATS_JOBS : collecte lancee (A: ' || v_schema_a ||
+                             ', B: ' || v_schema_b || ') - jobs ' || p_job_name_a ||
+                             ' / ' || p_job_name_b || ' (asynchrones)');
+    END SUBMIT_STATS_JOBS;
+
+
+    ----------------------------------------------------------------------
+    -- GET_STATS_JOB_STATUS  (fonction publique, v6)
+    ----------------------------------------------------------------------
+    FUNCTION GET_STATS_JOB_STATUS (p_job_name IN VARCHAR2) RETURN VARCHAR2 IS
+        v_state VARCHAR2(128);
+        v_last  VARCHAR2(128);
+    BEGIN
+        -- 1) État courant de l'objet job (existe tant que l'auto-drop n'a pas
+        --    eu lieu ; reste 'DISABLED' après une exécution lancée par
+        --    RUN_JOB sur un job créé enabled => FALSE).
+        BEGIN
+            SELECT state INTO v_state
+              FROM USER_SCHEDULER_JOBS
+             WHERE job_name = p_job_name;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                v_state := NULL;
+        END;
+
+        -- En cours ou planifié : ne PAS chercher plus loin.
+        IF v_state IN ('RUNNING', 'SCHEDULED') THEN
+            RETURN CASE v_state
+                WHEN 'RUNNING'   THEN C_JOB_STATUS_RUNNING
+                WHEN 'SCHEDULED' THEN C_JOB_STATUS_SCHEDULED
+            END;
+        END IF;
+
+        -- 2) Dernier run enregistré : source la PLUS FIABLE (couvre à la fois
+        --    l'auto-drop — objet disparu — et l'état DISABLED d'un objet
+        --    resté présent après une exécution réussie).
+        BEGIN
+            SELECT status INTO v_last
+              FROM USER_SCHEDULER_JOB_RUN_DETAILS
+             WHERE job_name = p_job_name
+             ORDER BY log_date DESC
+             FETCH FIRST 1 ROW ONLY;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                v_last := NULL;
+        END;
+
+        IF v_last IS NOT NULL THEN
+            RETURN CASE v_last
+                WHEN 'SUCCEEDED' THEN C_JOB_STATUS_SUCCEEDED
+                WHEN 'FAILED'    THEN C_JOB_STATUS_FAILED
+                WHEN 'STOPPED'   THEN C_JOB_STATUS_FAILED
+                ELSE v_last
+            END;
+        END IF;
+
+        -- 3) Fallback : état d'objet connu sans historique de run.
+        IF v_state IS NOT NULL THEN
+            RETURN CASE v_state
+                WHEN 'FAILED'    THEN C_JOB_STATUS_FAILED
+                WHEN 'SUCCEEDED' THEN C_JOB_STATUS_SUCCEEDED
+                ELSE v_state
+            END;
+        END IF;
+
+        RETURN C_JOB_STATUS_NOT_FOUND;
+    END GET_STATS_JOB_STATUS;
+
+
+    ----------------------------------------------------------------------
+    -- ARE_STATS_JOBS_DONE  (fonction publique, v6)
+    ----------------------------------------------------------------------
+    FUNCTION ARE_STATS_JOBS_DONE (
+        p_job_name_a IN VARCHAR2,
+        p_job_name_b IN VARCHAR2
+    ) RETURN BOOLEAN IS
+    BEGIN
+        RETURN GET_STATS_JOB_STATUS(p_job_name_a) = C_JOB_STATUS_SUCCEEDED
+           AND GET_STATS_JOB_STATUS(p_job_name_b) = C_JOB_STATUS_SUCCEEDED;
+    END ARE_STATS_JOBS_DONE;
+
+
+    ----------------------------------------------------------------------
+    -- WAIT_FOR_STATS_JOBS  (procédure publique, v6)
+    ----------------------------------------------------------------------
+    PROCEDURE WAIT_FOR_STATS_JOBS (
+        p_job_name_a    IN  VARCHAR2,
+        p_job_name_b    IN  VARCHAR2,
+        p_timeout_sec   IN  NUMBER   DEFAULT 3600,
+        p_all_succeeded OUT BOOLEAN
+    ) IS
+        v_timeout NUMBER := NVL(p_timeout_sec, 3600);
+        v_step    NUMBER := 5;    -- periode de sondage (secondes)
+        v_elapsed NUMBER := 0;
+        v_stat_a  VARCHAR2(30);
+        v_stat_b  VARCHAR2(30);
+    BEGIN
+        -- Attente BORNEE par p_timeout_sec, par sondage de
+        -- ARE_STATS_JOBS_DONE (DBMS_SCHEDULER.WAIT_FOR est indisponible sur
+        -- certaines distributions Oracle : le sondage est la solution
+        -- portable). DBMS_LOCK.SLEEP sert de "pulse" (grants Script 15).
+        LOOP
+            IF ARE_STATS_JOBS_DONE(p_job_name_a, p_job_name_b) THEN
+                p_all_succeeded := TRUE;
+                EXIT;
+            END IF;
+
+            v_stat_a := GET_STATS_JOB_STATUS(p_job_name_a);
+            v_stat_b := GET_STATS_JOB_STATUS(p_job_name_b);
+
+            IF v_stat_a IN (C_JOB_STATUS_SUCCEEDED, C_JOB_STATUS_FAILED, C_JOB_STATUS_NOT_FOUND)
+               AND v_stat_b IN (C_JOB_STATUS_SUCCEEDED, C_JOB_STATUS_FAILED, C_JOB_STATUS_NOT_FOUND) THEN
+                -- Les deux jobs sont dans un état FINAL (SUCCEEDED/FAILED/
+                -- NOT_FOUND) : inutile d'attendre le délai. NB : DISABLED
+                -- (job créé enabled=>FALSE, pas encore démarré) n'est PAS
+                -- final — on continue de sonder.
+                p_all_succeeded := ARE_STATS_JOBS_DONE(p_job_name_a, p_job_name_b);
+                EXIT;
+            END IF;
+
+            IF v_elapsed >= v_timeout THEN
+                p_all_succeeded := ARE_STATS_JOBS_DONE(p_job_name_a, p_job_name_b);
+                EXIT;
+            END IF;
+
+            DBMS_LOCK.SLEEP(v_step);
+            v_elapsed := v_elapsed + v_step;
+        END LOOP;
+    END WAIT_FOR_STATS_JOBS;
+
+
+    ----------------------------------------------------------------------
+    -- REPORT_COUNTS_GAP  (procédure publique, v6)
+    ----------------------------------------------------------------------
+    PROCEDURE REPORT_COUNTS_GAP (
+        p_schema_a      IN  VARCHAR2 DEFAULT C_SCHEMA_A,
+        p_schema_b      IN  VARCHAR2 DEFAULT C_SCHEMA_B,
+        p_job_name_a    IN  VARCHAR2 DEFAULT NULL,
+        p_job_name_b    IN  VARCHAR2 DEFAULT NULL,
+        p_max_age_hours IN  NUMBER   DEFAULT NULL,
+        p_gap_id        OUT NUMBER,
+        p_header_cursor OUT SYS_REFCURSOR,
+        p_detail_cursor OUT SYS_REFCURSOR
+    ) IS
+        TYPE t_gap_row IS RECORD (
+            table_name      VARCHAR2(128),
+            num_rows_a      NUMBER,
+            last_analyzed_a TIMESTAMP,
+            num_rows_b      NUMBER,
+            last_analyzed_b TIMESTAMP
+        );
+        TYPE t_gap_tab IS TABLE OF t_gap_row;
+
+        v_schema_a VARCHAR2(128);
+        v_schema_b VARCHAR2(128);
+        v_suffix_b VARCHAR2(128);
+        v_stats_a  TIMESTAMP;
+        v_stats_b  TIMESTAMP;
+        v_sql      VARCHAR2(4000);
+        v_rows     t_gap_tab;
+        v_total    NUMBER := 0;
+        v_ok       NUMBER := 0;
+        v_gap      NUMBER := 0;
+        v_ns_a     NUMBER := 0;
+        v_ns_b     NUMBER := 0;
+        v_diff     NUMBER;
+        v_pct      NUMBER;
+        v_max_age  TIMESTAMP;
+    BEGIN
+        v_schema_a := sanitize_ident(UPPER(TRIM(p_schema_a)));
+        v_schema_b := sanitize_ident(UPPER(TRIM(p_schema_b)));
+        -- Suffixe DB LINK éventuel pour les références au schéma B ('' en
+        -- mode « même instance » ; '@<LINK>' sinon).
+        v_suffix_b := NVL(b_link_suffix(), '');
+
+        -- Fraîcheur courante des stats (niveau table) de chaque côté.
+        SELECT MAX(last_analyzed) INTO v_stats_a
+          FROM ALL_TAB_STATISTICS
+         WHERE owner = v_schema_a AND object_type = 'TABLE';
+
+        EXECUTE IMMEDIATE
+            'SELECT MAX(last_analyzed) ' ||
+            '  FROM ALL_TAB_STATISTICS' || v_suffix_b ||
+            ' WHERE owner = :1 AND object_type = ''TABLE'''
+            INTO v_stats_b USING v_schema_b;
+
+        -- Fraîcheur minimale demandée : stats absentes ou trop anciennes d'un
+        -- côté -> E_STATS_NOT_FRESH (le rapport ne doit pas lire de stats
+        -- périmées, ce qui fausserait le diagnostic).
+        IF p_max_age_hours IS NOT NULL THEN
+            v_max_age := SYSTIMESTAMP - p_max_age_hours / 24;
+            IF v_stats_a IS NULL OR v_stats_b IS NULL
+               OR v_stats_a < v_max_age OR v_stats_b < v_max_age THEN
+                RAISE_APPLICATION_ERROR(-20013,
+                    'Stats absentes ou trop anciennes (p_max_age_hours=' ||
+                    TO_CHAR(p_max_age_hours) || ') : relancer la collecte. A=' ||
+                    TO_CHAR(v_stats_a, 'YYYY-MM-DD HH24:MI') || ' B=' ||
+                    TO_CHAR(v_stats_b, 'YYYY-MM-DD HH24:MI'));
+            END IF;
+        END IF;
+
+        -- Nouveau rapport (en-tête d'abord, totaux complétés après le calcul).
+        SELECT SYNC_STATS_GAP_ID_SEQ.NEXTVAL INTO p_gap_id FROM DUAL;
+
+        INSERT INTO SYNC_STATS_GAP (GAP_ID, JOB_NAME_A, JOB_NAME_B,
+                                    STATS_DATE_A, STATS_DATE_B)
+        VALUES (p_gap_id, p_job_name_a, p_job_name_b, v_stats_a, v_stats_b);
+
+        -- Périmètre + comptes estimes, en une passe :
+        --   * tables de BASE (TEMP='N') présentes dans les DEUX schémas
+        --     (jointure ALL_TABLES A x ALL_TABLES B sur TABLE_NAME) ;
+        --   * stats globales de table (ALL_TAB_STATISTICS, object_type
+        --     'TABLE', partition_name IS NULL), en LEFT JOIN : un NUM_ROWS
+        --     NULL signifie « stats absentes » de ce côté.
+        v_sql := 'SELECT a.table_name, sa.num_rows, sa.last_analyzed, ' ||
+                 '       sb.num_rows, sb.last_analyzed ' ||
+                 '  FROM ALL_TABLES a ' ||
+                 '  JOIN ALL_TABLES' || v_suffix_b || ' b ' ||
+                 '    ON b.table_name = a.table_name ' ||
+                 '   AND b.owner      = :owner_b ' ||
+                 '   AND b.temporary  = ''N'' ' ||
+                 '  LEFT JOIN ALL_TAB_STATISTICS sa ' ||
+                 '         ON sa.owner         = a.owner ' ||
+                 '        AND sa.table_name    = a.table_name ' ||
+                 '        AND sa.object_type   = ''TABLE'' ' ||
+                 '        AND sa.partition_name IS NULL ' ||
+                 '  LEFT JOIN ALL_TAB_STATISTICS' || v_suffix_b || ' sb ' ||
+                 '         ON sb.owner         = :owner_b2 ' ||
+                 '        AND sb.table_name    = a.table_name ' ||
+                 '        AND sb.object_type   = ''TABLE'' ' ||
+                 '        AND sb.partition_name IS NULL ' ||
+                 ' WHERE a.owner      = :owner_a ' ||
+                 '   AND a.temporary  = ''N'' ' ||
+                 ' ORDER BY a.table_name';
+
+        EXECUTE IMMEDIATE v_sql BULK COLLECT INTO v_rows
+            USING v_schema_b, v_schema_b, v_schema_a;
+
+        FOR i IN 1 .. v_rows.COUNT LOOP
+            v_total := v_total + 1;
+            v_diff  := NULL;
+            v_pct   := NULL;
+
+            IF v_rows(i).num_rows_a IS NULL AND v_rows(i).num_rows_b IS NULL THEN
+                -- Stats absentes des deux côtés : no stats, exclue du calcul
+                -- des écarts mais toujours comptabilisée dans l'en-tête.
+                v_ns_a := v_ns_a + 1;
+                v_ns_b := v_ns_b + 1;
+                INSERT INTO SYNC_STATS_GAP_DETAIL (DETAIL_ID, GAP_ID, TABLE_NAME,
+                    NUM_ROWS_A, NUM_ROWS_B, DIFF, DIFF_PCT, LAST_ANALYZED_A,
+                    LAST_ANALYZED_B, GAP_FLAG)
+                VALUES (SYNC_STATS_GAP_DETAIL_ID_SEQ.NEXTVAL, p_gap_id,
+                    v_rows(i).table_name, NULL, NULL, NULL, NULL,
+                    v_rows(i).last_analyzed_a, v_rows(i).last_analyzed_b,
+                    C_GAP_FLAG_NO_STATS_BOTH);
+            ELSIF v_rows(i).num_rows_a IS NULL THEN
+                v_ns_a := v_ns_a + 1;
+                INSERT INTO SYNC_STATS_GAP_DETAIL (DETAIL_ID, GAP_ID, TABLE_NAME,
+                    NUM_ROWS_A, NUM_ROWS_B, DIFF, DIFF_PCT, LAST_ANALYZED_A,
+                    LAST_ANALYZED_B, GAP_FLAG)
+                VALUES (SYNC_STATS_GAP_DETAIL_ID_SEQ.NEXTVAL, p_gap_id,
+                    v_rows(i).table_name, NULL, v_rows(i).num_rows_b, NULL, NULL,
+                    v_rows(i).last_analyzed_a, v_rows(i).last_analyzed_b,
+                    C_GAP_FLAG_NO_STATS_A);
+            ELSIF v_rows(i).num_rows_b IS NULL THEN
+                v_ns_b := v_ns_b + 1;
+                INSERT INTO SYNC_STATS_GAP_DETAIL (DETAIL_ID, GAP_ID, TABLE_NAME,
+                    NUM_ROWS_A, NUM_ROWS_B, DIFF, DIFF_PCT, LAST_ANALYZED_A,
+                    LAST_ANALYZED_B, GAP_FLAG)
+                VALUES (SYNC_STATS_GAP_DETAIL_ID_SEQ.NEXTVAL, p_gap_id,
+                    v_rows(i).table_name, v_rows(i).num_rows_a, NULL, NULL, NULL,
+                    v_rows(i).last_analyzed_a, v_rows(i).last_analyzed_b,
+                    C_GAP_FLAG_NO_STATS_B);
+            ELSIF v_rows(i).num_rows_a != v_rows(i).num_rows_b THEN
+                -- Écart de comptes estimés : DIFF / DIFF_PCT (base = max).
+                v_gap  := v_gap + 1;
+                v_diff := ABS(v_rows(i).num_rows_a - v_rows(i).num_rows_b);
+                v_pct  := ROUND(v_diff * 100 /
+                          NULLIF(GREATEST(v_rows(i).num_rows_a, v_rows(i).num_rows_b), 0), 2);
+                INSERT INTO SYNC_STATS_GAP_DETAIL (DETAIL_ID, GAP_ID, TABLE_NAME,
+                    NUM_ROWS_A, NUM_ROWS_B, DIFF, DIFF_PCT, LAST_ANALYZED_A,
+                    LAST_ANALYZED_B, GAP_FLAG)
+                VALUES (SYNC_STATS_GAP_DETAIL_ID_SEQ.NEXTVAL, p_gap_id,
+                    v_rows(i).table_name, v_rows(i).num_rows_a, v_rows(i).num_rows_b,
+                    v_diff, v_pct, v_rows(i).last_analyzed_a,
+                    v_rows(i).last_analyzed_b, C_GAP_FLAG_DIFF);
+            ELSE
+                -- Comptes estimés égaux : aucune anomalie, aucune ligne de détail.
+                v_ok := v_ok + 1;
+            END IF;
+        END LOOP;
+
+        -- Totaux de l'en-tête + validation du rapport (COMMIT : le rapport
+        -- est persistant et re-consultable via GET_LAST_GAP_ID).
+        UPDATE SYNC_STATS_GAP
+           SET TOTAL_TABLES      = v_total,
+               TABLES_OK         = v_ok,
+               TABLES_GAP        = v_gap,
+               TABLES_NO_STATS_A = v_ns_a,
+               TABLES_NO_STATS_B = v_ns_b
+         WHERE GAP_ID = p_gap_id;
+
+        COMMIT;
+
+        OPEN p_header_cursor FOR
+            SELECT gap_id, collect_date, job_name_a, job_name_b,
+                   stats_date_a, stats_date_b, total_tables, tables_ok,
+                   tables_gap, tables_no_stats_a, tables_no_stats_b, executed_by
+              FROM SYNC_STATS_GAP
+             WHERE gap_id = p_gap_id;
+
+        OPEN p_detail_cursor FOR
+            SELECT detail_id, gap_id, table_name, num_rows_a, num_rows_b,
+                   diff, diff_pct, last_analyzed_a, last_analyzed_b, gap_flag
+              FROM SYNC_STATS_GAP_DETAIL
+             WHERE gap_id = p_gap_id
+             ORDER BY diff DESC NULLS LAST, table_name;
+
+        DBMS_OUTPUT.PUT_LINE('REPORT_COUNTS_GAP : gap_id=' || p_gap_id ||
+            ' total=' || v_total || ' ok=' || v_ok || ' diff=' || v_gap ||
+            ' no_stats_A=' || v_ns_a || ' no_stats_B=' || v_ns_b);
+    END REPORT_COUNTS_GAP;
+
+
+    ----------------------------------------------------------------------
+    -- GET_LAST_GAP_ID  (fonction publique, v6)
+    ----------------------------------------------------------------------
+    FUNCTION GET_LAST_GAP_ID RETURN NUMBER IS
+        v_id NUMBER;
+    BEGIN
+        SELECT MAX(gap_id) INTO v_id FROM SYNC_STATS_GAP;
+        RETURN v_id;
+    END GET_LAST_GAP_ID;
 
 END PKG_SCHEMA_SYNC;
 /

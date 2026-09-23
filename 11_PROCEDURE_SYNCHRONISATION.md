@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 # Procédure — Configurer et lancer la synchronisation d'une liste de tables
 
-**Package concerné** : `PKG_SCHEMA_SYNC` (v5.3) — projet `ora_sync`
+**Package concerné** : `PKG_SCHEMA_SYNC` (v6 — état d'écart inclus) — projet `ora_sync`
 **Objet** : procédure opérationnelle complète pour synchroniser une liste de
 tables entre deux schémas jumeaux (`SCHEMA_A` →/↔ `SCHEMA_B`), avec les
 scripts de chaque étape, prêts à copier-coller.
@@ -497,6 +497,67 @@ Points clés :
   `MISSING_IN_B` exclu — comportement attendu).
 
 --------------------------------------------------------------------------------
+## 10. État d'écart schéma A/B (v6, stats Oracle)
+
+La fonctionnalité v6 rapporte les **écarts de comptes de lignes** entre les
+deux schémas, à l'échelle du schéma, à partir des statistiques Oracle
+(`NUM_ROWS` de l'optimiseur, niveau table). C'est un **état**, pas une
+synchronisation : il ne modifie aucune donnée métier — seules les stats sont
+(re)collectées et les tables `SYNC_STATS_GAP(_DETAIL)` reçoivent le rapport.
+
+**Limite assumée et documentée** : `NUM_ROWS` est une *estimation* de
+l'optimiseur, pas un `COUNT(*)` — l'écart est « statistique », idéal pour
+détecter une dérive de volumétrie (ex. insertions non répliquées), pas pour
+donner un chiffre exact.
+
+### 10.1 Workflow (asynchrone, hors pic)
+
+```bash
+# 0) Prérequis une fois (SYS) :
+python setup_project.py sql 14_sync_stats_gap_tables.sql
+python setup_project.py sql 15_sys_stats_gap_grants.sql --profile sys
+python setup_project.py sql 03_sync_package_spec.sql
+python setup_project.py sql 04_sync_package_body.sql
+
+# 1) Collecte + rapport + affichage (un seul geste) :
+python setup_project.py gap --schema-a PCARDIMPBO --schema-b PCARDIMPFE
+```
+
+Le CLI enchaîne : `SUBMIT_STATS_JOBS` (2 jobs `DBMS_SCHEDULER` asynchrones) →
+`WAIT_FOR_STATS_JOBS` (attente de fin, `--wait-timeout`, défaut 3600 s) →
+`REPORT_COUNTS_GAP` (rapport persistant + REF CURSOR) → affichage trié par
+écart décroissant. Options utiles :
+
+| Option | Rôle |
+|--------|------|
+| `--no-collect` | ne pas relancer la collecte (lire les stats courantes) |
+| `--max-age-hours N` | refuser le rapport si les stats d'un côté sont plus vieilles que N h (`E_STATS_NOT_FRESH`, `-20013`) |
+| `--limit N` | nombre de lignes de détail affichées |
+| `--schema-a / --schema-b` | schémas comparés (défaut : constantes compilées) |
+
+### 10.2 Lecture du rapport
+
+- En-tête (`SYNC_STATS_GAP`) : périmètre = tables de base présentes des deux
+  côtés ; totaux `TABLES_OK` / `TABLES_GAP` / `TABLES_NO_STATS_A/B` ;
+  `STATS_DATE_A/B` = fraîcheur constatée.
+- Détail (`SYNC_STATS_GAP_DETAIL`) : **anomalies uniquement** — `DIFF` (avec
+  `DIFF`/`DIFF_PCT`, base `GREATEST(A,B)`) ou `NO_STATS_A` / `NO_STATS_B` /
+  `NO_STATS_BOTH` (stats absentes : exclues du calcul, comptées dans
+  l'en-tête).
+- Re-consultation : `PKG_SCHEMA_SYNC.GET_LAST_GAP_ID()` puis lecture des
+  tables, ou `sql` sur `SYNC_STATS_GAP(/_DETAIL)` pour historique.
+- Purge : intégrée à `PURGE_HISTORY` ; remise à zéro complète : Script 13
+  (rapports + 2 séquences, `SYNC_RUN_OPTION` conservée).
+
+Pièges v1 :
+- **Multi-instances (DB LINK)** : la *lecture* du rapport sait lire les stats
+  distantes via le lien, mais la *collecte* distante n'est pas supportée
+  (`SUBMIT_STATS_JOBS` lève `-20014`) — collecter les stats de B dans la
+  session de suivi de B, puis `gap --no-collect`.
+- **Collecte coûteuse** sur un gros schéma (ex. 6 800+ tables) : à lancer hors
+  pic, et suivre l'avancement via `GET_STATS_JOB_STATUS`.
+
+--------------------------------------------------------------------------------
 ## Annexe A — Rappel de l'API publique (`03_sync_package_spec.sql`)
 
 | Procédure / fonction | Rôle |
@@ -509,6 +570,10 @@ Points clés :
 | `PURGE_HISTORY(keep_days)` | rétention de l'historique |
 | `SET_DB_LINK / GET_DB_LINK` | mode DB LINK distant |
 | `SET_RUN_OPTION / GET_RUN_OPTION` | options globales v5 |
+| `SUBMIT_STATS_JOBS(A, B, →jobs)` | **v6** : lancement asynchrone des collectes de stats (2 jobs) |
+| `GET_STATS_JOB_STATUS(job)` / `ARE_STATS_JOBS_DONE(A,B)` / `WAIT_FOR_STATS_JOBS(A,B,timeout,→ok)` | **v6** : suivi / attente de fin des collectes |
+| `REPORT_COUNTS_GAP(A, B, jobs, max_age, →gap_id, →hdr, →dtl)` | **v6** : rapport d'écart persistant + REF CURSOR |
+| `GET_LAST_GAP_ID()` | **v6** : dernier rapport généré |
 
 ## Annexe B — Références des scripts du projet
 
@@ -519,12 +584,14 @@ Points clés :
 | `03_sync_package_spec.sql` | spécification du package (constantes d'ancrage A/B) |
 | `04_sync_package_body.sql` | corps du package (fix v5.2 traçabilité, v5.3 graphe FK divergent) |
 | `05_sample_data_and_config.sql` | données + config d'exemple (CLIENT/PRODUIT/COMMANDE) |
-| `06_test_scenarios.sql`, `07_test_harness.sql` | scénarios et harnais 72 assertions |
+| `06_test_scenarios.sql`, `07_test_harness.sql` | scénarios et harnais 86 assertions (Bloc 11 = v6 état d'écart) |
 | `08_migration_v2.sql`, `09_*` | migrations et grants (SYS) |
 | `11_PROCEDURE_SYNCHRONISATION.md` | procédure opérationnelle (ce document) |
 | `12_SYNC_UNE_LISTE.sql` | **fichier unique paramétrable** : config + dry run (+ réel) + vérifs pour une liste de tables (§9) |
 | `13_RESET_CONFIG_HISTORIQUE.sql` | **remise à zéro** config + historique + séquences (§8.2, `SYNC_RUN_OPTION` conservée) |
-| `tools/orasync/` | CLI `setup_project.py` (`check`, `install`, `migrate`, `sql`, `sample`, `test`, `status`) |
+| `14_sync_stats_gap_tables.sql` | **v6** : tables `SYNC_STATS_GAP(_DETAIL)` + 2 séquences (§10) |
+| `15_sys_stats_gap_grants.sql` | **v6** : grants SYS de l'état d'écart (`ANALYZE ANY`, `CREATE JOB`, …) |
+| `tools/orasync/` | CLI `setup_project.py` (`check`, `install`, `migrate`, `sql`, `sample`, `test`, `status`, `gap`) |
 
 ## Annexe C — Patch temporaire des constantes `C_SCHEMA_A/B` (schémas ≠ compilés)
 

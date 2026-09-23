@@ -19,6 +19,16 @@
 -- lignes de scénario sont supprimées des deux côtés en fin de bloc — le
 -- moteur ne propageant jamais les suppressions, l'état initial est restauré
 -- à l'identique.
+--
+-- Le Bloc 11 (v6) exerce l'état d'écart schéma : collecte RÉELLE des stats
+-- par jobs DBMS_SCHEDULER sur les schémas de test (SCHEMA_A/SCHEMA_B, petits),
+-- attente asynchrone, génération du rapport persistant (SYNC_STATS_GAP),
+-- lecture des anomalies (SYNC_STATS_GAP_DETAIL) et de la garde de fraîcheur
+-- (E_STATS_NOT_FRESH). Pour rendre l'écart DÉTERMINISTE quelle que soit la
+-- dérive du jeu d'exemple, une ligne PRODUIT 900 est temporairement INSÉRÉE
+-- côté A seul puis RETIRÉE en fin de bloc (et les stats de PRODUIT
+-- re-collectées) : l'état initial est restauré à l'identique — seules les
+-- stats Oracle et les tables SYNC_STATS_GAP(_DETAIL) reçoivent des lignes.
 --------------------------------------------------------------------------------
 
 SET SERVEROUTPUT ON SIZE UNLIMITED;
@@ -904,6 +914,226 @@ BEGIN
             END;
             RAISE;
     END;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Bloc 11 : (v6) état d'écart schéma — collecte stats + rapport persistant
+--
+-- Exerce le workflow de la v6 sur les schémas de TEST. Le scénario est
+-- DÉTERMINISTE (indépendant de la dérive du jeu d'exemple) :
+--   * une ligne PRODUIT 900 est INSÉRÉE côté A SEUL (jamais côté B) avant la
+--     collecte : après un GATHER complet des stats (jobs DBMS_SCHEDULER
+--     asynchrones), le rapport doit classer PRODUIT en écart DIFF (diff >= 1)
+--     et n'avoir AUCUNE anomalie NO_STATS ;
+--   * API v6    : SUBMIT_STATS_JOBS -> WAIT_FOR_STATS_JOBS ->
+--     GET_STATS_JOB_STATUS / ARE_STATS_JOBS_DONE -> REPORT_COUNTS_GAP (REF
+--     CURSOR + persistance + COMMIT) -> GET_LAST_GAP_ID ; garde de fraîcheur
+--     E_STATS_NOT_FRESH ; détection des NO_STATS_* après suppression ciblée
+--     des stats d'une table (DELETE_TABLE_STATS) ;
+--   * garantir  : le rapport ne reçoit QUE des anomalies en détail ; les
+--     totaux de l'en-tête sont cohérents ; GET_LAST_GAP_ID pointe le dernier
+--     rapport ; absence totale d'effet sur SYNC_TABLE_CONFIG /
+--     SYNC_COLUMN_CONFIG (le bloc n'y touche pas) ;
+--   * restauration : suppression de la ligne PRODUIT 900 côté A, puis
+--     re-collecte des stats de PRODUIT (GATHER_TABLE_STATS) pour ne pas
+--     laisser le jeu de test dégradé (aucune ligne métier créée en dur par ce
+--     bloc — la ligne d'injection est retirée quoi qu'il arrive).
+--
+-- NB : nécessite les privilèges SYS du Script 15 (ANALYZE ANY, CREATE JOB,
+-- EXECUTE DBMS_STATS/DBMS_SCHEDULER/DBMS_LOCK) comme le Bloc 10 exige ceux
+-- du 09.
+--------------------------------------------------------------------------------
+DECLARE
+    TYPE t_hdr IS RECORD (
+        gap_id             NUMBER,
+        collect_date       TIMESTAMP,
+        job_name_a         VARCHAR2(128),
+        job_name_b         VARCHAR2(128),
+        stats_date_a       TIMESTAMP,
+        stats_date_b       TIMESTAMP,
+        total_tables       NUMBER,
+        tables_ok          NUMBER,
+        tables_gap         NUMBER,
+        tables_no_stats_a  NUMBER,
+        tables_no_stats_b  NUMBER,
+        executed_by        VARCHAR2(128)
+    );
+
+    v_job_a    VARCHAR2(128);
+    v_job_b    VARCHAR2(128);
+    v_ok       BOOLEAN;
+    v_status_a VARCHAR2(30);
+    v_status_b VARCHAR2(30);
+    v_gap_id   NUMBER;
+    v_gap_id2  NUMBER;
+    v_hdr      SYS_REFCURSOR;
+    v_dtl      SYS_REFCURSOR;
+    v_hr       t_hdr;
+    v_total    NUMBER;
+    v_ok_cnt   NUMBER;
+    v_gap_cnt  NUMBER;
+    v_ns_a     NUMBER;
+    v_ns_b     NUMBER;
+    v_err      NUMBER;
+    v_cnt      NUMBER;
+    v_diff     NUMBER;
+
+    PROCEDURE restore_state IS
+    BEGIN
+        -- Ligne d'injection retirée + stats de PRODUIT re-collectées.
+        BEGIN
+            EXECUTE IMMEDIATE 'DELETE FROM SCHEMA_A.PRODUIT WHERE PRODUIT_ID = 900';
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('  RESTORE donnees PRODUIT/A partiel : ' || SQLERRM);
+        END;
+        BEGIN
+            DBMS_STATS.GATHER_TABLE_STATS(ownname => 'SCHEMA_A', tabname => 'PRODUIT');
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('  RESTORE stats PRODUIT/A partiel : ' || SQLERRM);
+        END;
+        COMMIT;
+    END restore_state;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('== Bloc 11 : (v6) etat d''ecart schema (stats) ==');
+
+    ------------------------------------------------------------
+    -- 0) Scénario : une ligne présente en A SEUL (jamais en B)
+    ------------------------------------------------------------
+    DELETE FROM SCHEMA_A.PRODUIT WHERE PRODUIT_ID = 900;
+    INSERT INTO SCHEMA_A.PRODUIT (PRODUIT_ID, LIBELLE, PRIX_UNITAIRE)
+    VALUES (900, 'Produit du bloc 11 (injection A seul)', 1.00);
+    COMMIT;
+
+    ------------------------------------------------------------
+    -- 1) Collecte asynchrone des stats (jobs DBMS_SCHEDULER)
+    ------------------------------------------------------------
+    PKG_SCHEMA_SYNC.SUBMIT_STATS_JOBS(
+        p_job_name_a => v_job_a,
+        p_job_name_b => v_job_b
+    );
+    T_HARNESS.ASSERT_TRUE('SUBMIT_STATS_JOBS : deux noms de jobs rendus',
+        v_job_a IS NOT NULL AND v_job_b IS NOT NULL,
+        'A=' || v_job_a || ' B=' || v_job_b);
+
+    PKG_SCHEMA_SYNC.WAIT_FOR_STATS_JOBS(
+        p_job_name_a    => v_job_a,
+        p_job_name_b    => v_job_b,
+        p_timeout_sec   => 1800,
+        p_all_succeeded => v_ok
+    );
+    T_HARNESS.ASSERT_TRUE('WAIT_FOR_STATS_JOBS : les deux collectes ont reussi',
+        v_ok, 'ok=' || CASE WHEN v_ok THEN 'TRUE' ELSE 'FALSE' END);
+
+    v_status_a := PKG_SCHEMA_SYNC.GET_STATS_JOB_STATUS(v_job_a);
+    v_status_b := PKG_SCHEMA_SYNC.GET_STATS_JOB_STATUS(v_job_b);
+    T_HARNESS.ASSERT_TRUE('GET_STATS_JOB_STATUS : A et B en SUCCEEDED',
+        v_status_a = 'SUCCEEDED' AND v_status_b = 'SUCCEEDED',
+        'A=' || v_status_a || ' B=' || v_status_b);
+    T_HARNESS.ASSERT_TRUE('ARE_STATS_JOBS_DONE : TRUE apres la collecte',
+        PKG_SCHEMA_SYNC.ARE_STATS_JOBS_DONE(v_job_a, v_job_b));
+
+    ------------------------------------------------------------
+    -- 2) Rapport d'écart (avec garde de fraîcheur : stats fraîches)
+    ------------------------------------------------------------
+    PKG_SCHEMA_SYNC.REPORT_COUNTS_GAP(
+        p_max_age_hours => 48,
+        p_gap_id        => v_gap_id,
+        p_header_cursor => v_hdr,
+        p_detail_cursor => v_dtl
+    );
+    -- Le REF CURSOR d'en-tête doit restituer le rapport généré (12 colonnes).
+    FETCH v_hdr INTO v_hr;
+    CLOSE v_hdr;
+    CLOSE v_dtl;
+    T_HARNESS.ASSERT_TRUE('REPORT_COUNTS_GAP : gap_id genere et cursor coherent',
+        v_gap_id IS NOT NULL AND v_hr.gap_id = v_gap_id,
+        'gap_id=' || v_gap_id || ' cursor=' || v_hr.gap_id);
+
+    SELECT total_tables, tables_ok, tables_gap, tables_no_stats_a, tables_no_stats_b
+      INTO v_total, v_ok_cnt, v_gap_cnt, v_ns_a, v_ns_b
+      FROM SYNC_STATS_GAP WHERE gap_id = v_gap_id;
+
+    T_HARNESS.ASSERT_TRUE('Rapport : les tables d''exemple sont dans le perimetre',
+        v_total >= 4, 'total=' || v_total);
+    T_HARNESS.ASSERT_TRUE('Rapport : au moins un ecart DIFF', v_gap_cnt >= 1,
+        'gap=' || v_gap_cnt);
+    T_HARNESS.ASSERT_TRUE('Rapport : aucune anomalie NO_STATS apres collecte complete',
+        v_ns_a = 0 AND v_ns_b = 0, 'nsA=' || v_ns_a || ' nsB=' || v_ns_b);
+    T_HARNESS.ASSERT_TRUE('Rapport : coherence des totaux (ok+gap=total)',
+        v_ok_cnt + v_gap_cnt = v_total,
+        'ok=' || v_ok_cnt || ' gap=' || v_gap_cnt || ' total=' || v_total);
+
+    -- PRODUIT : ligne 900 présente en A seul -> anomalie DIFF au détail.
+    SELECT COUNT(*), NVL(MAX(diff), -1) INTO v_cnt, v_diff
+      FROM SYNC_STATS_GAP_DETAIL
+     WHERE gap_id = v_gap_id AND table_name = 'PRODUIT' AND gap_flag = 'DIFF';
+    T_HARNESS.ASSERT_TRUE('Detail : PRODUIT en ecart DIFF (diff >= 1)',
+        v_cnt = 1 AND v_diff >= 1, 'nb=' || v_cnt || ' diff=' || v_diff);
+
+    ------------------------------------------------------------
+    -- 3) Re-consultation : GET_LAST_GAP_ID pointe le rapport
+    ------------------------------------------------------------
+    T_HARNESS.ASSERT_TRUE('GET_LAST_GAP_ID : dernier rapport retrouve',
+        PKG_SCHEMA_SYNC.GET_LAST_GAP_ID = v_gap_id,
+        'last=' || PKG_SCHEMA_SYNC.GET_LAST_GAP_ID || ' attendu=' || v_gap_id);
+
+    ------------------------------------------------------------
+    -- 4) Garde de fraîcheur : stats trop anciennes -> E_STATS_NOT_FRESH
+    ------------------------------------------------------------
+    BEGIN
+        PKG_SCHEMA_SYNC.REPORT_COUNTS_GAP(
+            p_max_age_hours => 0.000001,   -- plus anciennes que ~3,6 ms
+            p_gap_id        => v_gap_id2,
+            p_header_cursor => v_hdr,
+            p_detail_cursor => v_dtl
+        );
+        v_err := 0;   -- pas d'erreur : le test devrait échouer
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_err := SQLCODE;
+    END;
+    T_HARNESS.ASSERT_TRUE('Rapport : stats trop anciennes rejetees (E_STATS_NOT_FRESH)',
+        v_err = -20013, 'sqlcode=' || v_err);
+
+    ------------------------------------------------------------
+    -- 5) Stats absentes d'un côté : NO_STATS_A détecté, puis restauration
+    ------------------------------------------------------------
+    DBMS_STATS.DELETE_TABLE_STATS(ownname => 'SCHEMA_A', tabname => 'PRODUIT');
+
+    PKG_SCHEMA_SYNC.REPORT_COUNTS_GAP(
+        p_gap_id        => v_gap_id2,
+        p_header_cursor => v_hdr,
+        p_detail_cursor => v_dtl
+    );
+    CLOSE v_hdr;
+    CLOSE v_dtl;
+
+    SELECT COUNT(*) INTO v_cnt
+      FROM SYNC_STATS_GAP_DETAIL
+     WHERE gap_id = v_gap_id2 AND table_name = 'PRODUIT' AND gap_flag = 'NO_STATS_A';
+    T_HARNESS.ASSERT_TRUE('Detail : PRODUIT en NO_STATS_A apres purge des stats A',
+        v_cnt = 1, 'nb=' || v_cnt);
+
+    SELECT tables_no_stats_a INTO v_ns_a
+      FROM SYNC_STATS_GAP WHERE gap_id = v_gap_id2;
+    T_HARNESS.ASSERT_TRUE('En-tete : TABLES_NO_STATS_A compte l''anomalie',
+        v_ns_a >= 1, 'nsA=' || v_ns_a);
+
+    -- Restauration : ligne 900 retirée + stats de PRODUIT re-collectées.
+    restore_state;
+    T_HARNESS.RESULT('stats_gap_v6');
+EXCEPTION
+    WHEN OTHERS THEN
+        BEGIN
+            restore_state;
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('  RESTORE partiel : ' || SQLERRM);
+        END;
+        RAISE;
 END;
 /
 

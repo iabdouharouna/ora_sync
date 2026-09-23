@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import oracledb
+
 from .config import ConfigError, Settings
 from .db import connect
 from .sqlplus import RunStats, SqlPlusRunner
@@ -30,6 +32,7 @@ class ScriptSpec:
 SCHEMA_SCRIPTS: tuple[ScriptSpec, ...] = (
     ScriptSpec("01_sync_config_tables.sql", "admin", "Tables de configuration"),
     ScriptSpec("02_sync_log_tables.sql", "admin", "Tables de journalisation"),
+    ScriptSpec("14_sync_stats_gap_tables.sql", "admin", "Tables d'etat d'ecart (stats)"),
 )
 
 # Scripts du PACKAGE (specification puis corps) — exécutés EN DERNIER, après
@@ -239,6 +242,141 @@ def run_sql_file(
         tolerate_idempotent_errors=tolerate_idempotent_errors,
         dry_run=dry_run,
     )
+
+
+def report_gap(
+    settings: Settings,
+    *,
+    schema_a: str | None = None,
+    schema_b: str | None = None,
+    max_age_hours: float | None = None,
+    collect: bool = True,
+    wait_timeout: int = 3600,
+) -> dict:
+    """Genere l'etat d'ecart de volumetrie A/B (stats Oracle, v6).
+
+    Workflow complet si collect=True (defaut) : lancement des jobs de
+    collecte des stats (SUBMIT_STATS_JOBS), attente asynchrone de leur fin
+    (WAIT_FOR_STATS_JOBS), puis generation du rapport persistant
+    (REPORT_COUNTS_GAP). Retourne un dictionnaire (gap_id, entete, detail)
+    pret a afficher par l'appelant.
+    """
+
+    from .db import session
+
+    result: dict = {"gap_id": None, "header": None, "detail": [], "jobs": None}
+
+    with session(settings, "admin") as connection:
+        with connection.cursor() as cursor:
+            # 1) Collecte explicite des stats (asynchrone) + attente de fin.
+            if collect:
+                got_a = cursor.var(str)
+                got_b = cursor.var(str)
+                cursor.execute(
+                    """
+                    DECLARE
+                        v_a  VARCHAR2(128) := NVL(:sa, PKG_SCHEMA_SYNC.C_SCHEMA_A);
+                        v_b  VARCHAR2(128) := NVL(:sb, PKG_SCHEMA_SYNC.C_SCHEMA_B);
+                        v_ja VARCHAR2(128);
+                        v_jb VARCHAR2(128);
+                    BEGIN
+                        PKG_SCHEMA_SYNC.SUBMIT_STATS_JOBS(
+                            p_schema_a   => v_a,
+                            p_schema_b   => v_b,
+                            p_job_name_a => v_ja,
+                            p_job_name_b => v_jb);
+                        :ja := v_ja;
+                        :jb := v_jb;
+                    END;""",
+                    sa=schema_a,
+                    sb=schema_b,
+                    ja=got_a,
+                    jb=got_b,
+                )
+                job_a, job_b = got_a.getvalue(), got_b.getvalue()
+                result["jobs"] = (job_a, job_b)
+
+                got_ok = cursor.var(str)
+                cursor.execute(
+                    """
+                    DECLARE
+                        v_ok BOOLEAN;
+                    BEGIN
+                        PKG_SCHEMA_SYNC.WAIT_FOR_STATS_JOBS(
+                            p_job_name_a    => :ja,
+                            p_job_name_b    => :jb,
+                            p_timeout_sec   => :timeout,
+                            p_all_succeeded => v_ok);
+                        :ok := CASE WHEN v_ok THEN 'Y' ELSE 'N' END;
+                    END;""",
+                    ja=job_a,
+                    jb=job_b,
+                    timeout=wait_timeout,
+                    ok=got_ok,
+                )
+                if got_ok.getvalue() != "Y":
+                    raise ConfigError(
+                        "Collecte des stats sans succes sur l'un des schemas "
+                        f"(jobs {job_a} / {job_b}) - verifier USER_SCHEDULER_JOB_RUN_DETAILS."
+                    )
+
+            # 2) Generation du rapport + recuperation des REF CURSOR.
+            got_gap = cursor.var(int)
+            got_header = cursor.var(oracledb.CURSOR)
+            got_detail = cursor.var(oracledb.CURSOR)
+            cursor.execute(
+                """
+                DECLARE
+                    v_a   VARCHAR2(128) := NVL(:sa, PKG_SCHEMA_SYNC.C_SCHEMA_A);
+                    v_b   VARCHAR2(128) := NVL(:sb, PKG_SCHEMA_SYNC.C_SCHEMA_B);
+                    v_gap NUMBER;
+                    v_h   SYS_REFCURSOR;
+                    v_d   SYS_REFCURSOR;
+                BEGIN
+                    PKG_SCHEMA_SYNC.REPORT_COUNTS_GAP(
+                        p_schema_a      => v_a,
+                        p_schema_b      => v_b,
+                        p_max_age_hours => :mh,
+                        p_gap_id        => v_gap,
+                        p_header_cursor => v_h,
+                        p_detail_cursor => v_d);
+                    :gap   := v_gap;
+                    :hdr   := v_h;
+                    :dtl   := v_d;
+                END;""",
+                sa=schema_a,
+                sb=schema_b,
+                mh=max_age_hours,
+                gap=got_gap,
+                hdr=got_header,
+                dtl=got_detail,
+            )
+
+            result["gap_id"] = got_gap.getvalue()
+
+            header_cursor = got_header.getvalue()
+            header_row = header_cursor.fetchone()
+            if header_row:
+                columns = [
+                    "gap_id", "collect_date", "job_name_a", "job_name_b",
+                    "stats_date_a", "stats_date_b", "total_tables", "tables_ok",
+                    "tables_gap", "tables_no_stats_a", "tables_no_stats_b",
+                    "executed_by",
+                ]
+                result["header"] = dict(zip(columns, header_row))
+
+            detail_cursor = got_detail.getvalue()
+            detail_columns = [
+                "detail_id", "gap_id", "table_name", "num_rows_a", "num_rows_b",
+                "diff", "diff_pct", "last_analyzed_a", "last_analyzed_b", "gap_flag",
+            ]
+            while True:
+                row = detail_cursor.fetchone()
+                if row is None:
+                    break
+                result["detail"].append(dict(zip(detail_columns, row)))
+
+    return result
 
 
 def fetch_status(settings: Settings, limit: int = 10) -> list[tuple]:

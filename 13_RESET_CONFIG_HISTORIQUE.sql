@@ -4,14 +4,18 @@
 -- Objet      : purger l'intégralité de la CONFIGURATION (SYNC_TABLE_CONFIG,
 --              SYNC_COLUMN_CONFIG, SYNC_KEY_CONFIG) et de l'HISTORIQUE
 --              (SYNC_RUN_HEADER, SYNC_LOG, SYNC_CONFLICT,
---              SYNC_COMPATIBILITY_REPORT), puis remettre TOUTES les séquences
---              à 1 (prochain RUN_ID = 1).
+--              SYNC_COMPATIBILITY_REPORT, et depuis la v6 les rapports
+--              d'état d'écart SYNC_STATS_GAP / SYNC_STATS_GAP_DETAIL),
+--              puis remettre TOUTES les séquences à 1 (prochain RUN_ID = 1).
 --
 -- CONSERVÉE  : SYNC_RUN_OPTION (options d'exécution v5) — jamais modifiée.
 --
 -- NOTE GTT   : les tables de travail SYNC_WORK_HASH_A/B et SYNC_WORK_DIFF
 --              sont des tables temporaires globales DE SESSION : elles se
 --              vident toutes seules, rien à faire ici.
+--
+-- PRÉALABLE  : les tables d'état d'écart (Script 14) doivent exister — sinon
+--              exécuter d'abord : python setup_project.py sql 14_sync_stats_gap_tables.sql
 --
 -- ⚠ DESTRUCTIF : supprime TOUTES les données de configuration et
 --   d'historique. À n'exécuter qu'en fenêtre de maintenance, après avoir
@@ -42,16 +46,21 @@ UNION ALL SELECT 'SYNC_RUN_HEADER',     COUNT(*) FROM SYNC_RUN_HEADER
 UNION ALL SELECT 'SYNC_LOG',            COUNT(*) FROM SYNC_LOG
 UNION ALL SELECT 'SYNC_CONFLICT',       COUNT(*) FROM SYNC_CONFLICT
 UNION ALL SELECT 'SYNC_COMPATIBILITY_REPORT', COUNT(*) FROM SYNC_COMPATIBILITY_REPORT
+UNION ALL SELECT 'SYNC_STATS_GAP_DETAIL', COUNT(*) FROM SYNC_STATS_GAP_DETAIL
+UNION ALL SELECT 'SYNC_STATS_GAP',       COUNT(*) FROM SYNC_STATS_GAP
 UNION ALL SELECT 'SYNC_RUN_OPTION (CONSERVEE)', COUNT(*) FROM SYNC_RUN_OPTION;
 
 -- ============================================================================
 -- ÉTAPE 2 — Purge (ordre FK : enfants avant parents)
 -- ============================================================================
--- 2.1 Historique : les tables de détail référencent SYNC_RUN_HEADER (RUN_ID).
+-- 2.1 Historique : les tables de détail référencent SYNC_RUN_HEADER (RUN_ID)
+--     et SYNC_STATS_GAP (GAP_ID).
 DELETE FROM SYNC_LOG;
 DELETE FROM SYNC_CONFLICT;
 DELETE FROM SYNC_COMPATIBILITY_REPORT;
 DELETE FROM SYNC_RUN_HEADER;
+DELETE FROM SYNC_STATS_GAP_DETAIL;
+DELETE FROM SYNC_STATS_GAP;
 
 -- 2.2 Configuration : SYNC_COLUMN_CONFIG / SYNC_KEY_CONFIG référencent
 --     SYNC_TABLE_CONFIG (TABLE_NAME).
@@ -69,11 +78,13 @@ PROMPT Purge effectuee et COMMIT. SYNC_RUN_OPTION non touchee.
 -- ÉTAPE 3 — Remise des séquences à 1 (prochain RUN_ID / LOG_ID / ... = 1)
 -- ============================================================================
 -- Association séquence -> table :
---   SYNC_RUN_ID_SEQ          -> SYNC_RUN_HEADER.RUN_ID
---   SYNC_LOG_ID_SEQ          -> SYNC_LOG.LOG_ID
---   SYNC_CONFLICT_ID_SEQ     -> SYNC_CONFLICT.CONFLICT_ID
---   SYNC_COMPAT_REPORT_ID_SEQ-> SYNC_COMPATIBILITY_REPORT.REPORT_ID
---   SYNC_COMPAT_CHECK_ID_SEQ -> SYNC_COMPATIBILITY_REPORT.CHECK_ID
+--   SYNC_RUN_ID_SEQ            -> SYNC_RUN_HEADER.RUN_ID
+--   SYNC_LOG_ID_SEQ            -> SYNC_LOG.LOG_ID
+--   SYNC_CONFLICT_ID_SEQ       -> SYNC_CONFLICT.CONFLICT_ID
+--   SYNC_COMPAT_REPORT_ID_SEQ  -> SYNC_COMPATIBILITY_REPORT.REPORT_ID
+--   SYNC_COMPAT_CHECK_ID_SEQ   -> SYNC_COMPATIBILITY_REPORT.CHECK_ID
+--   SYNC_STATS_GAP_ID_SEQ      -> SYNC_STATS_GAP.GAP_ID
+--   SYNC_STATS_GAP_DETAIL_ID_SEQ -> SYNC_STATS_GAP_DETAIL.DETAIL_ID
 DECLARE
     v_n NUMBER;
     v_seq VARCHAR2(128);
@@ -82,7 +93,9 @@ BEGIN
               UNION ALL SELECT 'SYNC_LOG_ID_SEQ' FROM DUAL
               UNION ALL SELECT 'SYNC_CONFLICT_ID_SEQ' FROM DUAL
               UNION ALL SELECT 'SYNC_COMPAT_REPORT_ID_SEQ'  FROM DUAL
-              UNION ALL SELECT 'SYNC_COMPAT_CHECK_ID_SEQ'   FROM DUAL) LOOP
+              UNION ALL SELECT 'SYNC_COMPAT_CHECK_ID_SEQ'   FROM DUAL
+              UNION ALL SELECT 'SYNC_STATS_GAP_ID_SEQ'      FROM DUAL
+              UNION ALL SELECT 'SYNC_STATS_GAP_DETAIL_ID_SEQ' FROM DUAL) LOOP
         v_seq := r.seq_name;
         SELECT COUNT(*) INTO v_n
           FROM user_sequences
@@ -109,6 +122,8 @@ UNION ALL SELECT 'SYNC_RUN_HEADER',     COUNT(*) FROM SYNC_RUN_HEADER
 UNION ALL SELECT 'SYNC_LOG',            COUNT(*) FROM SYNC_LOG
 UNION ALL SELECT 'SYNC_CONFLICT',       COUNT(*) FROM SYNC_CONFLICT
 UNION ALL SELECT 'SYNC_COMPATIBILITY_REPORT', COUNT(*) FROM SYNC_COMPATIBILITY_REPORT
+UNION ALL SELECT 'SYNC_STATS_GAP_DETAIL', COUNT(*) FROM SYNC_STATS_GAP_DETAIL
+UNION ALL SELECT 'SYNC_STATS_GAP',       COUNT(*) FROM SYNC_STATS_GAP
 UNION ALL SELECT 'SYNC_RUN_OPTION (CONSERVEE)', COUNT(*) FROM SYNC_RUN_OPTION;
 
 SELECT sequence_name, last_number

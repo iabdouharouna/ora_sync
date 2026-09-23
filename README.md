@@ -23,6 +23,7 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 9. [Changelog v4](#9-changelog-v4)
 10. [Changelog v5](#10-changelog-v5)
 11. [Outillage de déploiement et industrialisation](#11-outillage-de-déploiement-et-industrialisation)
+12. [Changelog v6](#12-changelog-v6)
 
 > **Procédure opérationnelle** : pour configurer et lancer une synchronisation
 > d'une liste de tables (scripts étape par étape), voir
@@ -31,6 +32,11 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 > [`12_SYNC_UNE_LISTE.sql`](12_SYNC_UNE_LISTE.sql) ; pour une remise à zéro de
 > la configuration/historique (séquences incluses, options conservées), voir
 > [`13_RESET_CONFIG_HISTORIQUE.sql`](13_RESET_CONFIG_HISTORIQUE.sql).
+>
+> **État d'écart schéma (v6)** : pour comparer les volumétries A/B à partir
+> des statistiques Oracle (collecte explicite en amont), utiliser
+> `python setup_project.py gap --schema-a <A> --schema-b <B>` (voir
+> [§12 Changelog v6](#12-changelog-v6)).
 
 ---
 
@@ -523,7 +529,9 @@ Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automati
 | `setup [--with-sample] [--run-tests]` | Enchaîne `install` [+ `sample`] [+ `test`] | selon étape |
 | `sql <fichier> [--profile P] [--continue-on-error]` | Exécute un script SQL\*Plus arbitraire | `admin` par défaut |
 | `sql 09_sys_auto_repair_grants.sql --profile sys` | Octroi idempotent des privilèges SYS d'auto-réparation v5 (une fois, **avant** `install`/`migrate`) | `sys` |
+| `sql 15_sys_stats_gap_grants.sql --profile sys` | Octroi idempotent des privilèges SYS de l'état d'écart v6 (une fois, avant le premier `gap`) | `sys` |
 | `status [--limit N]` | Affiche les dernières exécutions (`SYNC_RUN_HEADER`) | `admin` |
+| `gap [--schema-a A] [--schema-b B] [--max-age-hours N] [--no-collect] [--wait-timeout S] [--limit N]` | État d'écart des comptes de lignes A/B (stats Oracle) : collecte asynchrone des stats (sauf `--no-collect`), attente de fin, génération du rapport persistant puis affichage trié par écart décroissant | `admin` |
 
 Options globales : `--env-file`, `-v`/`-vv` (verbosité), `--dry-run` (affiche les actions sans exécuter les scripts).
 
@@ -546,3 +554,54 @@ Les connexions sont décrites par des variables préfixées `ORASYNC_`, chargée
 - **Tests stricts** : `test` ne tolère aucune erreur ; toute assertion en échec est remontée par le harnais (`RAISE_APPLICATION_ERROR -20999`) et le code de retour du processus est non nul.
 - **Codes de retour** : `0` succès, `1` échec fonctionnel, `2` erreur de configuration/usage.
 - **Sans `ensurepip`** (certaines distributions) : l'environnement est créé sans `pip` puis amorcé via le `pip` de l'hôte (`pip --python`), qui doit être ≥ 22.3. `ORASYNC_NO_VENV=1` force l'utilisation de l'interpréteur courant.
+
+---
+
+## 12. Changelog v6
+
+Enrichissement fonctionnel apporté en v6 : **état d'écart schéma A/B basé sur les statistiques Oracle** (rapport des écarts de comptes de lignes entre les deux schémas, collecte explicite en amont).
+
+### 12.1. Principe et périmètre
+
+- **Critère v1** : différence de **nombre de records par table**, mesurée sur les statistiques Oracle (`NUM_ROWS` de l'optimiseur, niveau table via `ALL_TAB_STATISTICS` : `object_type='TABLE'` et `partition_name IS NULL`, soit les stats globales — table partitionnée comprise).
+- **Périmètre** : tables de base (`TEMP='N'`) **présentes à la fois dans A et B**. Les tables absentes d'un côté sont hors rapport (comme les tables configurées `MISSING_IN_B` de la synchro) — elles font l'objet de la synchro classique, pas du diagnostic de volumétrie.
+- **Collecte explicite en amont** : les stats sont fraîches par construction — deux jobs `DBMS_SCHEDULER` asynchrones (`GATHER_SCHEMA_STATS`) lancés par `SUBMIT_STATS_JOBS`, surveillés par `ARE_STATS_JOBS_DONE` / `WAIT_FOR_STATS_JOBS`. À lancer **hors pic d'activité**.
+- **Limite assumée (documentée)** : `NUM_ROWS` est une **estimation** de l'optimiseur, pas un `COUNT(*)` exact — l'écart rapporté est « statistique », indicatif de dérive, pas une photographie exacte.
+
+### 12.2. Décisions utilisateur appliquées
+
+- Jobs `DBMS_SCHEDULER` **asynchrones** (pilotage : `SUBMIT_STATS_JOBS` → `WAIT_FOR_STATS_JOBS`).
+- Livraison : **package + tables + CLI** (commande `gap`).
+- **Tout écart > 0** est rapporté avec `DIFF` et `DIFF_PCT` (base `GREATEST(A,B)`, arrondi 2 décimales).
+- Tables à `NUM_ROWS` **NULL** d'un côté : flag `NO_STATS_A` / `NO_STATS_B` / `NO_STATS_BOTH`, **exclues du calcul** des écarts et **comptées dans l'en-tête** du rapport.
+
+### 12.3. Modèle de données
+
+- `SYNC_STATS_GAP` (en-tête, Script 14) : `GAP_ID` (séquence), `COLLECT_DATE`, `JOB_NAME_A/B`, `STATS_DATE_A/B` (MAX `LAST_ANALYZED` constaté), `TOTAL_TABLES`, `TABLES_OK`, `TABLES_GAP`, `TABLES_NO_STATS_A/B`, `EXECUTED_BY` — une ligne = un rapport.
+- `SYNC_STATS_GAP_DETAIL` (détail) : **uniquement les anomalies** (`DIFF`, `NO_STATS_*`) — aucune ligne pour une table en écart nul ; `TABLE_NAME`, `NUM_ROWS_A/B`, `DIFF`, `DIFF_PCT`, `LAST_ANALYZED_A/B`, `GAP_FLAG` (contrainte `CK_SSGD_FLAG`).
+- Séquences dédiées : `SYNC_STATS_GAP_ID_SEQ`, `SYNC_STATS_GAP_DETAIL_ID_SEQ`.
+- Purge intégrée à `PURGE_HISTORY` (détail d'abord — FK — puis en-têtes, sur `COLLECT_DATE`).
+
+### 12.4. API publique ajoutée (Scripts 3/4)
+
+```sql
+PKG_SCHEMA_SYNC.SUBMIT_STATS_JOBS(p_schema_a, p_schema_b, p_job_name_a, p_job_name_b);
+PKG_SCHEMA_SYNC.GET_STATS_JOB_STATUS(p_job_name)          RETURN VARCHAR2;  -- SUCCEEDED/RUNNING/...
+PKG_SCHEMA_SYNC.ARE_STATS_JOBS_DONE(p_job_name_a, p_job_name_b) RETURN BOOLEAN;
+PKG_SCHEMA_SYNC.WAIT_FOR_STATS_JOBS(p_job_name_a, p_job_name_b, p_timeout_sec, p_all_succeeded);
+PKG_SCHEMA_SYNC.REPORT_COUNTS_GAP(p_schema_a, p_schema_b, p_job_name_a, p_job_name_b,
+                                  p_max_age_hours, p_gap_id, p_header_cursor, p_detail_cursor);
+PKG_SCHEMA_SYNC.GET_LAST_GAP_ID()                         RETURN NUMBER;
+```
+
+- `REPORT_COUNTS_GAP` **persiste** (COMMIT) puis rend deux REF CURSOR (en-tête, détail trié `DIFF DESC NULLS LAST`) ; `p_max_age_hours` renseigné et stats absentes/trop anciennes d'un côté → `E_STATS_NOT_FRESH` (`-20013`).
+- Constantes : `C_GAP_FLAG_*`, `C_JOB_STATUS_*` ; exception `E_STATS_NOT_FRESH`.
+- **Mode DB LINK (v1)** : la *lecture* du rapport sait lire les stats distantes via le DB LINK (`ALL_TAB_STATISTICS@…`) ; la *collecte* distante n'est pas supportée (`SUBMIT_STATS_JOBS` lève `-20014`) — en multi-instances, collecter les stats de B dans la session de suivi de B.
+
+### 12.5. Scripts et validation
+
+- **Scripts 14/15** : tables+séquences (14), grants SYS idempotents (15 : `ANALYZE ANY`, `CREATE JOB`, `EXECUTE DBMS_STATS/SCHEDULER`, `SELECT ANY TABLE` — lecture du dictionnaire des stats).
+- **Script 13 étendu** : purge complète des rapports d'écart + remise à 1 des 2 séquences (options `SYNC_RUN_OPTION` toujours conservées).
+- **Harnais 07 étendu** : Bloc 11 (v6) — collecte réelle par jobs sur les schémas de test, attente asynchrone, génération et re-consultation du rapport (`GET_LAST_GAP_ID`), garde de fraîcheur (`-20013`), détection `NO_STATS_A` après purge ciblée des stats, restauration des stats — **86 assertions** au total (72 + 14).
+- **CLI** : commande `gap` — `python setup_project.py gap --schema-a A --schema-b B [--max-age-hours N] [--no-collect] [--wait-timeout S] [--limit N]`.
+- **Limites v1 assumées** : `NUM_ROWS` estimé (pas `COUNT(*)`) ; collecte distante non supportée ; la fraîcheur n'est contrôlée que si `p_max_age_hours` est fourni (sinon l'opérateur s'appuie sur `STATS_DATE_A/B` de l'en-tête).

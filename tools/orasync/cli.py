@@ -13,6 +13,7 @@ from .project import (
     fetch_status,
     install_core,
     migrate,
+    report_gap,
     run_harness,
     run_sample,
     run_sql_file,
@@ -32,6 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
             f"  python {PROG} setup --with-sample\n"
             f"  python {PROG} test\n"
             f"  python {PROG} sql 09_test_sync_mode.sql\n"
+            f"  python {PROG} gap --schema-a PCARDIMPBO --schema-b PCARDIMPFE\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"ora_sync {__version__}")
@@ -92,6 +94,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "status", help="affiche les dernieres synchronisations", parents=[common]
     )
     status.add_argument("--limit", type=int, default=10, help="nombre de lignes (defaut : 10)")
+
+    gap = sub.add_parser(
+        "gap",
+        help="etat d'ecart de volumetrie A/B a partir des stats Oracle (v6)",
+        parents=[common],
+    )
+    gap.add_argument(
+        "--schema-a",
+        help="schema cote A (defaut : constante compilee C_SCHEMA_A)",
+    )
+    gap.add_argument(
+        "--schema-b",
+        help="schema cote B (defaut : constante compilee C_SCHEMA_B)",
+    )
+    gap.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=None,
+        help="fraichueur maxi des stats en heures (defaut : sans controle)",
+    )
+    gap.add_argument(
+        "--no-collect",
+        action="store_true",
+        help="ne pas relancer la collecte des stats (lire les stats courantes)",
+    )
+    gap.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=3600,
+        help="attente maximale des jobs de collecte en secondes (defaut : 3600)",
+    )
+    gap.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="nombre de lignes de detail affichees (defaut : 50)",
+    )
 
     setup = sub.add_parser(
         "setup",
@@ -159,6 +198,71 @@ def _cmd_sql(args, settings) -> int:
     return 0
 
 
+def _cmd_gap(args, settings) -> int:
+    report = report_gap(
+        settings,
+        schema_a=args.schema_a,
+        schema_b=args.schema_b,
+        max_age_hours=args.max_age_hours,
+        collect=not args.no_collect,
+        wait_timeout=args.wait_timeout,
+    )
+    header = report["header"] or {}
+
+    print("Etat d'ecart des comptes de lignes (stats Oracle)")
+    print(f"  rapport  : gap_id={report['gap_id']}")
+    if report["jobs"]:
+        print(f"  collecte : {' / '.join(report['jobs'])} (reussie)")
+    else:
+        print("  collecte : aucune relance (--no-collect), lecture des stats courantes")
+    print(
+        "  stats    : A={a}  B={b}".format(
+            a=header.get("stats_date_a") or "n/d",
+            b=header.get("stats_date_b") or "n/d",
+        )
+    )
+    print(
+        "  perimetre: {total} tables - {ok} a parite - {gap} en ecart "
+        "(NO_STATS_A={nsa}, NO_STATS_B={nsb})".format(
+            total=header.get("total_tables"),
+            ok=header.get("tables_ok"),
+            gap=header.get("tables_gap"),
+            nsa=header.get("tables_no_stats_a"),
+            nsb=header.get("tables_no_stats_b"),
+        )
+    )
+
+    rows = report["detail"][: max(args.limit, 0)]
+    if not rows:
+        print("  detail   : aucune anomalie (comptes estimes alignes)")
+        return 0
+
+    headings = ["table", "A", "B", "DIFF", "DIFF%", "flag"]
+    data = [
+        [
+            str(row["table_name"]),
+            "-" if row["num_rows_a"] is None else str(row["num_rows_a"]),
+            "-" if row["num_rows_b"] is None else str(row["num_rows_b"]),
+            "-" if row["diff"] is None else str(row["diff"]),
+            "-" if row["diff_pct"] is None else str(row["diff_pct"]),
+            str(row["gap_flag"]),
+        ]
+        for row in rows
+    ]
+    widths = [len(head) for head in headings]
+    for line in data:
+        for index, value in enumerate(line):
+            widths[index] = max(widths[index], len(value))
+    print("  " + " | ".join(head.ljust(widths[i]) for i, head in enumerate(headings)))
+    print("  " + "-+-".join("-" * width for width in widths))
+    for line in data:
+        print("  " + " | ".join(value.ljust(widths[i]) for i, value in enumerate(line)))
+    if len(report["detail"]) > len(rows):
+        print(f"  ... ({len(report['detail']) - len(rows)} anomalie(s) en plus : "
+              "revoir avec --limit)")
+    return 0
+
+
 def _cmd_status(args, settings) -> int:
     rows = fetch_status(settings, limit=args.limit)
     if not rows:
@@ -196,6 +300,7 @@ _HANDLERS = {
     "test": _cmd_test,
     "sql": _cmd_sql,
     "status": _cmd_status,
+    "gap": _cmd_gap,
     "setup": _cmd_setup,
 }
 

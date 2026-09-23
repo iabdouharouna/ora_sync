@@ -536,6 +536,184 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
 
     FUNCTION GET_RUN_OPTION (p_option_name IN VARCHAR2) RETURN VARCHAR2;
 
+    ----------------------------------------------------------------------
+    -- SECTION « ÉTAT D'ÉCART SCHÉMA (STATS) » — v6
+    --
+    -- Offre un état des écarts de volumétrie entre SCHEMA_A et SCHEMA_B à
+    -- l'échelle du schéma, établi à partir des statistiques Oracle
+    -- (NUM_ROWS de l'optimiseur, niveau table), dont la fraîcheur est
+    -- garantie par une collecte EXPLICITE préalable des stats sur les deux
+    -- schémas (jobs DBMS_SCHEDULER lancés par SUBMIT_STATS_JOBS,
+    -- surveillés par ARE_STATS_JOBS_DONE / WAIT_FOR_STATS_JOBS).
+    --
+    -- Périmètre  : tables de base (TEMP='N') présentes dans les DEUX schémas.
+    -- NB (limite assumée, documentée) : NUM_ROWS est une ESTIMATION de
+    -- l'optimiseur, pas un COUNT(*) exact — l'écart rapporté est donc
+    -- « statistique », pas une photo de la donnée à l'instant T.
+    --
+    -- Workflow type (asynchrone, hors pic d'activité) :
+    --   1) SUBMIT_STATS_JOBS  -> 2 jobs de collecte lancés en arrière-plan ;
+    --   2) WAIT_FOR_STATS_JOBS (ou sondage ARE_STATS_JOBS_DONE) ;
+    --   3) REPORT_COUNTS_GAP  -> rapport persistant (SYNC_STATS_GAP et
+    --      SYNC_STATS_GAP_DETAIL) + deux REF CURSOR (en-tête, détail) ; le
+    --      dernier rapport reste aussi consultable via GET_LAST_GAP_ID.
+    --   La purge d'anciens rapports est intégrée à PURGE_HISTORY.
+    ----------------------------------------------------------------------
+
+    -- GAP_FLAG (SYNC_STATS_GAP_DETAIL.GAP_FLAG) :
+    --   DIFF          : comptes estimés différents (NUM_ROWS_A != NUM_ROWS_B)
+    --   NO_STATS_A    : stats absentes côté A (NUM_ROWS_A NULL) — exclue du
+    --                   calcul DIFF/TABLES_GAP, comptée dans le TOTAL/TABLES_
+    --                   NO_STATS_* de l'en-tête
+    --   NO_STATS_B    : idem côté B
+    --   NO_STATS_BOTH : stats absentes des deux côtés
+    C_GAP_FLAG_DIFF          CONSTANT VARCHAR2(13) := 'DIFF';
+    C_GAP_FLAG_NO_STATS_A    CONSTANT VARCHAR2(13) := 'NO_STATS_A';
+    C_GAP_FLAG_NO_STATS_B    CONSTANT VARCHAR2(13) := 'NO_STATS_B';
+    C_GAP_FLAG_NO_STATS_BOTH CONSTANT VARCHAR2(13) := 'NO_STATS_BOTH';
+
+    -- Statuts renvoyés par GET_STATS_JOB_STATUS / WAIT_FOR_STATS_JOBS :
+    C_JOB_STATUS_SUCCEEDED   CONSTANT VARCHAR2(30) := 'SUCCEEDED';
+    C_JOB_STATUS_RUNNING     CONSTANT VARCHAR2(30) := 'RUNNING';
+    C_JOB_STATUS_SCHEDULED   CONSTANT VARCHAR2(30) := 'SCHEDULED';
+    C_JOB_STATUS_FAILED      CONSTANT VARCHAR2(30) := 'FAILED';
+    C_JOB_STATUS_NOT_FOUND   CONSTANT VARCHAR2(30) := 'NOT_FOUND';
+
+    -- Levée par REPORT_COUNTS_GAP quand p_max_age_hours est renseigné et que
+    -- les stats sont absentes ou trop anciennes de l'un des deux côtés.
+    E_STATS_NOT_FRESH        EXCEPTION;
+    PRAGMA EXCEPTION_INIT (E_STATS_NOT_FRESH, -20013);
+
+    ----------------------------------------------------------------------
+    -- SUBMIT_STATS_JOBS
+    --
+    -- Crée (si absent) puis LANCE immédiatement deux jobs DBMS_SCHEDULER
+    -- de collecte des statistiques de schéma (GATHER_SCHEMA_STATS), un par
+    -- côté. La collecte est ASYNCHRONE : la procédure retourne dès le
+    -- lancement des jobs (auto_drop => TRUE : chaque job disparaît de
+    -- USER_SCHEDULER_JOBS après son exécution, seuls les historiques de
+    -- runs restent consultables).
+    --
+    -- Paramètres :
+    --   p_schema_a   : schéma "côté A" (défaut : C_SCHEMA_A).
+    --   p_schema_b   : schéma "côté B" (défaut : C_SCHEMA_B) — la collecte
+    --                  v1 n'est supportée qu'en mode "même instance"
+    --                  (C_DB_LINK_B NULL) : dans un déploiement multi-
+    --                  instances, lancer la collecte des stats du schéma B
+    --                  dans la session de suivi de B (le rapport, lui, sait
+    --                  lire les stats distantes via le DB LINK).
+    --   p_job_name_a / p_job_name_b : noms effectifs des jobs (à conserver
+    --                  pour ARE_STATS_JOBS_DONE / WAIT_FOR_STATS_JOBS).
+    --
+    -- Privilèges requis (Script 15) : ANALYZE ANY, CREATE JOB, EXECUTE sur
+    -- DBMS_STATS et DBMS_SCHEDULER.
+    ----------------------------------------------------------------------
+    PROCEDURE SUBMIT_STATS_JOBS (
+        p_schema_a      IN  VARCHAR2 DEFAULT C_SCHEMA_A,
+        p_schema_b      IN  VARCHAR2 DEFAULT C_SCHEMA_B,
+        p_job_name_a    OUT VARCHAR2,
+        p_job_name_b    OUT VARCHAR2
+    );
+
+    ----------------------------------------------------------------------
+    -- GET_STATS_JOB_STATUS
+    --
+    -- Retourne l'état d'un job de collecte : SUCCEEDED / RUNNING / SCHEDULED /
+    -- FAILED, ou NOT_FOUND si le job est inconnu (jamais lancé, ou historique
+    -- de runs vidé). Après auto_drop, l'état est relu dans l'historique des
+    -- runs (USER_SCHEDULER_JOB_RUN_DETAILS) : un job correctement terminé
+    -- reste SUCCEEDED même s'il n'existe plus dans USER_SCHEDULER_JOBS.
+    ----------------------------------------------------------------------
+    FUNCTION GET_STATS_JOB_STATUS (
+        p_job_name IN VARCHAR2
+    ) RETURN VARCHAR2;
+
+    ----------------------------------------------------------------------
+    -- ARE_STATS_JOBS_DONE
+    --
+    -- TRUE si les DEUX collectes sont terminées avec succès (statut
+    -- SUCCEEDED des deux côtés). Retourne FALSE tant qu'au moins l'une des
+    -- deux est en cours, planifiée, en échec ou introuvable.
+    ----------------------------------------------------------------------
+    FUNCTION ARE_STATS_JOBS_DONE (
+        p_job_name_a IN VARCHAR2,
+        p_job_name_b IN VARCHAR2
+    ) RETURN BOOLEAN;
+
+    ----------------------------------------------------------------------
+    -- WAIT_FOR_STATS_JOBS
+    --
+    -- Attend la fin des DEUX collectes en sondant ARE_STATS_JOBS_DONE à
+    -- intervalle régulier (DBMS_LOCK.SLEEP, tous les 5 s), borné par
+    -- p_timeout_sec — solution portable : DBMS_SCHEDULER.WAIT_FOR n'est pas
+    -- disponible sur toutes les distributions Oracle.
+    --
+    -- Paramètres :
+    --   p_job_name_a / p_job_name_b : noms rendus par SUBMIT_STATS_JOBS.
+    --   p_timeout_sec   : temps d'attente maximal (défaut 3600 s) ; l'attente
+    --                     s'interrompt plus tôt dès que les deux jobs sont
+    --                     dans un état final (SUCCEEDED/FAILED/NOT_FOUND).
+    --   p_all_succeeded : TRUE si les deux jobs se sont terminés en
+    --                     SUCCEEDED ; FALSE sinon (échec ou dépassement du
+    --                     délai — examiner GET_STATS_JOB_STATUS).
+    ----------------------------------------------------------------------
+    PROCEDURE WAIT_FOR_STATS_JOBS (
+        p_job_name_a    IN  VARCHAR2,
+        p_job_name_b    IN  VARCHAR2,
+        p_timeout_sec   IN  NUMBER   DEFAULT 3600,
+        p_all_succeeded OUT BOOLEAN
+    );
+
+    ----------------------------------------------------------------------
+    -- REPORT_COUNTS_GAP
+    --
+    -- Génère le rapport d'écart de volumétrie A/B sur la base des stats
+    -- COURANTES (à collecter en amont via SUBMIT_STATS_JOBS). Le rapport
+    -- est PERSISTÉ (SYNC_STATS_GAP + SYNC_STATS_GAP_DETAIL, séquences
+    -- dédiées) puis COMMITé — deux REF CURSOR sont rendus à l'appelant pour
+    -- affichage immédiat (en-tête + détail), le rapport restant consultable
+    -- ensuite via GET_LAST_GAP_ID / les tables.
+    --
+    -- Détermination des écarts (côtés A et B, niveau table — partition_name
+    -- IS NULL, object_type = 'TABLE') :
+    --   * tables présentes des DEUX côtés : périmètre du rapport (TOTAL) ;
+    --   * NUM_ROWS A/B          : ALL_TAB_STATISTICS (estimation optimiseur) ;
+    --   * DIFF  = ABS(A - B) ; DIFF_PCT = DIFF * 100 / GREATEST(A, B) ;
+    --   * NUM_ROWS absent d'un côté : anomalie NO_STATS_* (hors calcul des
+    --     écarts, comptée dans l'en-tête).
+    -- Fraîcheur : p_max_age_hours non NULL et stats d'un côté absentes ou
+    -- plus anciennes que (SYSTIMESTAMP - p_max_age_hours) -> E_STATS_NOT_FRESH.
+    --
+    -- Paramètres :
+    --   p_schema_a / p_schema_b : schémas comparés (défauts C_SCHEMA_A/B).
+    --   p_job_name_a / p_job_name_b : (optionnels) noms des jobs de collecte,
+    --                  reportés dans l'en-tête pour traçabilité.
+    --   p_max_age_hours : fraîcheur maximale acceptée des stats (optionnel).
+    --   p_gap_id        : identifiant du rapport généré.
+    --   p_header_cursor : ligne de SYNC_STATS_GAP (en-tête + totaux).
+    --   p_detail_cursor : lignes de SYNC_STATS_GAP_DETAIL (anomalies
+    --                     uniquement), triées DIFF DESC puis TABLE_NAME.
+    ----------------------------------------------------------------------
+    PROCEDURE REPORT_COUNTS_GAP (
+        p_schema_a      IN  VARCHAR2 DEFAULT C_SCHEMA_A,
+        p_schema_b      IN  VARCHAR2 DEFAULT C_SCHEMA_B,
+        p_job_name_a    IN  VARCHAR2 DEFAULT NULL,
+        p_job_name_b    IN  VARCHAR2 DEFAULT NULL,
+        p_max_age_hours IN  NUMBER   DEFAULT NULL,
+        p_gap_id        OUT NUMBER,
+        p_header_cursor OUT SYS_REFCURSOR,
+        p_detail_cursor OUT SYS_REFCURSOR
+    );
+
+    ----------------------------------------------------------------------
+    -- GET_LAST_GAP_ID
+    --
+    -- Retourne le GAP_ID du rapport le plus récent (MAX de SYNC_STATS_GAP),
+    -- ou NULL si aucun rapport n'a encore été généré. Permet de re-consulter
+    -- à tout moment le dernier état d'écart sans le régénérer.
+    ----------------------------------------------------------------------
+    FUNCTION GET_LAST_GAP_ID RETURN NUMBER;
+
 END PKG_SCHEMA_SYNC;
 /
 
