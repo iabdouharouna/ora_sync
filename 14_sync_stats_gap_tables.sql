@@ -67,8 +67,8 @@ CREATE TABLE SYNC_STATS_GAP_DETAIL (
     TABLE_NAME      VARCHAR2(128)   NOT NULL,
     NUM_ROWS_A      NUMBER,                     -- NUM_ROWS côté A (NULL = stats absentes)
     NUM_ROWS_B      NUMBER,                     -- idem côté B
-    DIFF            NUMBER,                     -- ABS(NUM_ROWS_A - NUM_ROWS_B), NULL si stats absentes
-    DIFF_PCT        NUMBER,                     -- DIFF * 100 / GREATEST(NUM_ROWS_A, NUM_ROWS_B), arrondi 2 décimales
+    DIFF            NUMBER,                     -- NUM_ROWS_B - NUM_ROWS_A (signé), NULL si stats absentes
+    DIFF_PCT        NUMBER,                     -- |DIFF| * 100 / GREATEST(NUM_ROWS_A, NUM_ROWS_B), arrondi 2 décimales
     LAST_ANALYZED_A TIMESTAMP,                  -- LAST_ANALYZED du niveau table côté A
     LAST_ANALYZED_B TIMESTAMP,                  -- idem côté B
     GAP_FLAG        VARCHAR2(13)    NOT NULL,   -- DIFF / NO_STATS_A / NO_STATS_B / NO_STATS_BOTH
@@ -86,7 +86,7 @@ COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.GAP_ID          IS 'Rapport parent (FK S
 COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.TABLE_NAME      IS 'Table de base presente des deux cotes';
 COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.NUM_ROWS_A      IS 'NUM_ROWS (estimation optimiseur) cote A, NULL si stats absentes';
 COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.NUM_ROWS_B      IS 'NUM_ROWS (estimation optimiseur) cote B, NULL si stats absentes';
-COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.DIFF            IS 'Ecart absolu de comptes estimes (NULL si stats absentes des deux cotes)';
+COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.DIFF            IS 'Ecart signe de comptes estimes : NUM_ROWS_B - NUM_ROWS_A (NULL si stats absentes des deux cotes)';
 COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.DIFF_PCT        IS 'Ecart relatif, base GREATEST(NUM_ROWS_A, NUM_ROWS_B)';
 COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.LAST_ANALYZED_A IS 'Date de collecte des stats (niveau table) cote A';
 COMMENT ON COLUMN SYNC_STATS_GAP_DETAIL.LAST_ANALYZED_B IS 'Date de collecte des stats (niveau table) cote B';

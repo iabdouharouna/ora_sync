@@ -572,13 +572,13 @@ Enrichissement fonctionnel apporté en v6 : **état d'écart schéma A/B basé s
 
 - Jobs `DBMS_SCHEDULER` **asynchrones** (pilotage : `SUBMIT_STATS_JOBS` → `WAIT_FOR_STATS_JOBS`).
 - Livraison : **package + tables + CLI** (commande `gap`).
-- **Tout écart > 0** est rapporté avec `DIFF` et `DIFF_PCT` (base `GREATEST(A,B)`, arrondi 2 décimales).
+- **Tout écart > 0** est rapporté avec `DIFF` **signé** (`DIFF = NUM_ROWS_B - NUM_ROWS_A` : positif si B a plus de lignes que A, négatif sinon) et `DIFF_PCT` (base `GREATEST(A,B)`, arrondi 2 décimales).
 - Tables à `NUM_ROWS` **NULL** d'un côté : flag `NO_STATS_A` / `NO_STATS_B` / `NO_STATS_BOTH`, **exclues du calcul** des écarts et **comptées dans l'en-tête** du rapport.
 
 ### 12.3. Modèle de données
 
 - `SYNC_STATS_GAP` (en-tête, Script 14) : `GAP_ID` (séquence), `COLLECT_DATE`, `JOB_NAME_A/B`, `STATS_DATE_A/B` (MAX `LAST_ANALYZED` constaté), `TOTAL_TABLES`, `TABLES_OK`, `TABLES_GAP`, `TABLES_NO_STATS_A/B`, `EXECUTED_BY` — une ligne = un rapport.
-- `SYNC_STATS_GAP_DETAIL` (détail) : **uniquement les anomalies** (`DIFF`, `NO_STATS_*`) — aucune ligne pour une table en écart nul ; `TABLE_NAME`, `NUM_ROWS_A/B`, `DIFF`, `DIFF_PCT`, `LAST_ANALYZED_A/B`, `GAP_FLAG` (contrainte `CK_SSGD_FLAG`).
+- `SYNC_STATS_GAP_DETAIL` (détail) : **uniquement les anomalies** (`DIFF`, `NO_STATS_*`) — aucune ligne pour une table en écart nul ; `TABLE_NAME`, `NUM_ROWS_A/B`, `DIFF` (signé, `B - A`), `DIFF_PCT`, `LAST_ANALYZED_A/B`, `GAP_FLAG` (contrainte `CK_SSGD_FLAG`).
 - Séquences dédiées : `SYNC_STATS_GAP_ID_SEQ`, `SYNC_STATS_GAP_DETAIL_ID_SEQ`.
 - Purge intégrée à `PURGE_HISTORY` (détail d'abord — FK — puis en-têtes, sur `COLLECT_DATE`).
 
@@ -594,7 +594,7 @@ PKG_SCHEMA_SYNC.REPORT_COUNTS_GAP(p_schema_a, p_schema_b, p_job_name_a, p_job_na
 PKG_SCHEMA_SYNC.GET_LAST_GAP_ID()                         RETURN NUMBER;
 ```
 
-- `REPORT_COUNTS_GAP` **persiste** (COMMIT) puis rend deux REF CURSOR (en-tête, détail trié `DIFF DESC NULLS LAST`) ; `p_max_age_hours` renseigné et stats absentes/trop anciennes d'un côté → `E_STATS_NOT_FRESH` (`-20013`).
+- `REPORT_COUNTS_GAP` **persiste** (COMMIT) puis rend deux REF CURSOR (en-tête, détail trié `|DIFF| DESC NULLS LAST`) ; `p_max_age_hours` renseigné et stats absentes/trop anciennes d'un côté → `E_STATS_NOT_FRESH` (`-20013`).
 - Constantes : `C_GAP_FLAG_*`, `C_JOB_STATUS_*` ; exception `E_STATS_NOT_FRESH`.
 - **Mode DB LINK (v1)** : la *lecture* du rapport sait lire les stats distantes via le DB LINK (`ALL_TAB_STATISTICS@…`) ; la *collecte* distante n'est pas supportée (`SUBMIT_STATS_JOBS` lève `-20014`) — en multi-instances, collecter les stats de B dans la session de suivi de B.
 

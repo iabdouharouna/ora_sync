@@ -924,8 +924,9 @@ END;
 -- DÉTERMINISTE (indépendant de la dérive du jeu d'exemple) :
 --   * une ligne PRODUIT 900 est INSÉRÉE côté A SEUL (jamais côté B) avant la
 --     collecte : après un GATHER complet des stats (jobs DBMS_SCHEDULER
---     asynchrones), le rapport doit classer PRODUIT en écart DIFF (diff >= 1)
---     et n'avoir AUCUNE anomalie NO_STATS ;
+--     asynchrones), le rapport doit classer PRODUIT en écart DIFF (A plus
+--     fourni que B : DIFF = B - A <= -1 — le signe est vérifié ici) et
+--     n'avoir AUCUNE anomalie NO_STATS ;
 --   * API v6    : SUBMIT_STATS_JOBS -> WAIT_FOR_STATS_JOBS ->
 --     GET_STATS_JOB_STATUS / ARE_STATS_JOBS_DONE -> REPORT_COUNTS_GAP (REF
 --     CURSOR + persistance + COMMIT) -> GET_LAST_GAP_ID ; garde de fraîcheur
@@ -1070,8 +1071,8 @@ BEGIN
     SELECT COUNT(*), NVL(MAX(diff), -1) INTO v_cnt, v_diff
       FROM SYNC_STATS_GAP_DETAIL
      WHERE gap_id = v_gap_id AND table_name = 'PRODUIT' AND gap_flag = 'DIFF';
-    T_HARNESS.ASSERT_TRUE('Detail : PRODUIT en ecart DIFF (diff >= 1)',
-        v_cnt = 1 AND v_diff >= 1, 'nb=' || v_cnt || ' diff=' || v_diff);
+    T_HARNESS.ASSERT_TRUE('Detail : PRODUIT en ecart DIFF (B-A <= -1)',
+        v_cnt = 1 AND v_diff <= -1, 'nb=' || v_cnt || ' diff=' || v_diff);
 
     ------------------------------------------------------------
     -- 3) Re-consultation : GET_LAST_GAP_ID pointe le rapport

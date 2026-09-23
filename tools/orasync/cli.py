@@ -198,6 +198,23 @@ def _cmd_sql(args, settings) -> int:
     return 0
 
 
+def _fmt_signed(value) -> str:
+    """Affiche DIFF avec un signe explicite (+/-).
+
+    Convention v6 : DIFF = NUM_ROWS_B - NUM_ROWS_A (positif si B a plus de
+    lignes que A). Gère les nombres entiers (Decimal d'oracledb inclus) et
+    décimaux, et laisse 'None' sur un tiret.
+    """
+    if value is None:
+        return "-"
+    try:
+        if float(value).is_integer():
+            return f"{int(value):+d}"
+        return f"{value:+g}"
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
 def _cmd_gap(args, settings) -> int:
     report = report_gap(
         settings,
@@ -231,6 +248,7 @@ def _cmd_gap(args, settings) -> int:
             nsb=header.get("tables_no_stats_b"),
         )
     )
+    print("  DIFF     : B - A (signe + : B a plus de lignes que A)")
 
     rows = report["detail"][: max(args.limit, 0)]
     if not rows:
@@ -243,7 +261,7 @@ def _cmd_gap(args, settings) -> int:
             str(row["table_name"]),
             "-" if row["num_rows_a"] is None else str(row["num_rows_a"]),
             "-" if row["num_rows_b"] is None else str(row["num_rows_b"]),
-            "-" if row["diff"] is None else str(row["diff"]),
+            "-" if row["diff"] is None else _fmt_signed(row["diff"]),
             "-" if row["diff_pct"] is None else str(row["diff_pct"]),
             str(row["gap_flag"]),
         ]

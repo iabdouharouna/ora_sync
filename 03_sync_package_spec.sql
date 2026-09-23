@@ -678,7 +678,8 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     -- IS NULL, object_type = 'TABLE') :
     --   * tables présentes des DEUX côtés : périmètre du rapport (TOTAL) ;
     --   * NUM_ROWS A/B          : ALL_TAB_STATISTICS (estimation optimiseur) ;
-    --   * DIFF  = ABS(A - B) ; DIFF_PCT = DIFF * 100 / GREATEST(A, B) ;
+    --   * DIFF  = NUM_ROWS_B - NUM_ROWS_A (SIGNÉ : positif si B a plus de
+    --     lignes que A, négatif sinon) ; DIFF_PCT = |DIFF| * 100 / GREATEST(A, B) ;
     --   * NUM_ROWS absent d'un côté : anomalie NO_STATS_* (hors calcul des
     --     écarts, comptée dans l'en-tête).
     -- Fraîcheur : p_max_age_hours non NULL et stats d'un côté absentes ou
@@ -692,7 +693,7 @@ CREATE OR REPLACE PACKAGE PKG_SCHEMA_SYNC AUTHID DEFINER AS
     --   p_gap_id        : identifiant du rapport généré.
     --   p_header_cursor : ligne de SYNC_STATS_GAP (en-tête + totaux).
     --   p_detail_cursor : lignes de SYNC_STATS_GAP_DETAIL (anomalies
-    --                     uniquement), triées DIFF DESC puis TABLE_NAME.
+    --                     uniquement), triées |DIFF| DESC puis TABLE_NAME.
     ----------------------------------------------------------------------
     PROCEDURE REPORT_COUNTS_GAP (
         p_schema_a      IN  VARCHAR2 DEFAULT C_SCHEMA_A,

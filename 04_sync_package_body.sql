@@ -4599,10 +4599,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                     v_rows(i).last_analyzed_a, v_rows(i).last_analyzed_b,
                     C_GAP_FLAG_NO_STATS_B);
             ELSIF v_rows(i).num_rows_a != v_rows(i).num_rows_b THEN
-                -- Écart de comptes estimés : DIFF / DIFF_PCT (base = max).
+                -- Écart de comptes estimés : DIFF SIGNÉ (B - A : positif si B
+                -- a plus de lignes que A, négatif sinon) / DIFF_PCT (base = max,
+                -- sur la valeur absolue de l'écart).
                 v_gap  := v_gap + 1;
-                v_diff := ABS(v_rows(i).num_rows_a - v_rows(i).num_rows_b);
-                v_pct  := ROUND(v_diff * 100 /
+                v_diff := (v_rows(i).num_rows_b - v_rows(i).num_rows_a);
+                v_pct  := ROUND(ABS(v_diff) * 100 /
                           NULLIF(GREATEST(v_rows(i).num_rows_a, v_rows(i).num_rows_b), 0), 2);
                 INSERT INTO SYNC_STATS_GAP_DETAIL (DETAIL_ID, GAP_ID, TABLE_NAME,
                     NUM_ROWS_A, NUM_ROWS_B, DIFF, DIFF_PCT, LAST_ANALYZED_A,
@@ -4641,7 +4643,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
                    diff, diff_pct, last_analyzed_a, last_analyzed_b, gap_flag
               FROM SYNC_STATS_GAP_DETAIL
              WHERE gap_id = p_gap_id
-             ORDER BY diff DESC NULLS LAST, table_name;
+             ORDER BY ABS(diff) DESC NULLS LAST, table_name;
 
         DBMS_OUTPUT.PUT_LINE('REPORT_COUNTS_GAP : gap_id=' || p_gap_id ||
             ' total=' || v_total || ' ok=' || v_ok || ' diff=' || v_gap ||

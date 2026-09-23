@@ -540,8 +540,10 @@ Le CLI enchaîne : `SUBMIT_STATS_JOBS` (2 jobs `DBMS_SCHEDULER` asynchrones) →
 - En-tête (`SYNC_STATS_GAP`) : périmètre = tables de base présentes des deux
   côtés ; totaux `TABLES_OK` / `TABLES_GAP` / `TABLES_NO_STATS_A/B` ;
   `STATS_DATE_A/B` = fraîcheur constatée.
-- Détail (`SYNC_STATS_GAP_DETAIL`) : **anomalies uniquement** — `DIFF` (avec
-  `DIFF`/`DIFF_PCT`, base `GREATEST(A,B)`) ou `NO_STATS_A` / `NO_STATS_B` /
+- Détail (`SYNC_STATS_GAP_DETAIL`) : **anomalies uniquement** — `DIFF`
+  **signé** (`NUM_ROWS_B - NUM_ROWS_A` : `+` si B a plus de lignes que A,
+  `-` sinon ; `DIFF_PCT` sur la valeur absolue, base `GREATEST(A,B)`) ou
+  `NO_STATS_A` / `NO_STATS_B` /
   `NO_STATS_BOTH` (stats absentes : exclues du calcul, comptées dans
   l'en-tête).
 - Re-consultation : `PKG_SCHEMA_SYNC.GET_LAST_GAP_ID()` puis lecture des
