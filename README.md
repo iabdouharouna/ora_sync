@@ -28,7 +28,9 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 > d'une liste de tables (scripts étape par étape), voir
 > [`11_PROCEDURE_SYNCHRONISATION.md`](11_PROCEDURE_SYNCHRONISATION.md) ;
 > pour une exécution « tout-en-un » paramétrable, voir
-> [`12_SYNC_UNE_LISTE.sql`](12_SYNC_UNE_LISTE.sql).
+> [`12_SYNC_UNE_LISTE.sql`](12_SYNC_UNE_LISTE.sql) ; pour une remise à zéro de
+> la configuration/historique (séquences incluses, options conservées), voir
+> [`13_RESET_CONFIG_HISTORIQUE.sql`](13_RESET_CONFIG_HISTORIQUE.sql).
 
 ---
 

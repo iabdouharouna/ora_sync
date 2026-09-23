@@ -433,6 +433,12 @@ END;
 
 ### 8.2 Purge totale + remise à zéro (décision explicite, maintenance)
 
+**Script prêt à l'emploi : `13_RESET_CONFIG_HISTORIQUE.sql`**
+(`python setup_project.py sql 13_RESET_CONFIG_HISTORIQUE.sql`) — purge complète
+de la configuration et de l'historique, remise de toutes les séquences à 1,
+avec **`SYNC_RUN_OPTION` conservée telle quelle**. L'ordre ci-dessous est
+celui appliqué par ce script (FK : enfants avant parents) :
+
 ```sql
 -- Ordre imposé par les FK : enfants avant parents
 DELETE FROM SYNC_CONFLICT;
@@ -517,6 +523,7 @@ Points clés :
 | `08_migration_v2.sql`, `09_*` | migrations et grants (SYS) |
 | `11_PROCEDURE_SYNCHRONISATION.md` | procédure opérationnelle (ce document) |
 | `12_SYNC_UNE_LISTE.sql` | **fichier unique paramétrable** : config + dry run (+ réel) + vérifs pour une liste de tables (§9) |
+| `13_RESET_CONFIG_HISTORIQUE.sql` | **remise à zéro** config + historique + séquences (§8.2, `SYNC_RUN_OPTION` conservée) |
 | `tools/orasync/` | CLI `setup_project.py` (`check`, `install`, `migrate`, `sql`, `sample`, `test`, `status`) |
 
 ## Annexe C — Patch temporaire des constantes `C_SCHEMA_A/B` (schémas ≠ compilés)
