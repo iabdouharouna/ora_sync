@@ -32,21 +32,17 @@ DECLARE
     -- ========================================================================
     -- Liste des tables à synchroniser, SÉPARÉES PAR DES VIRGULES.
     c_liste      CONSTANT VARCHAR2(4000) :=
-        'BANK,BANK_ADDENDUM,BANK_NETWORK,RESOURCES,CONTROL_VERIFICATION_FLAGS,'
-      || 'CARD_RANGE,MER_ACCEPTOR_POINT,STOP_LIST_VERSIONS,ACQ_ONUS_RANGE,'
-      || 'CONVERSION_RATE,CARD_PRODUCT,REPLACEMENT_REASON_CODE,ISS_POSTING_RULES,'
-      || 'EMV_KEYS_ASSIGNMENT,POS_PROFILE,POS_ISO_PREFIXES_DT,POS_ISO_PREFIXES,'
-      || 'POS_ISO_LOCAL_BINS,HSM_KEY_MEMBER,P7_ROUTING_CRITERIA';
+      'NDC_WATCH_CONFIG';
 
     -- Schémas jumeaux (doivent correspondre aux constantes compilées du package).
     c_schema_a   CONSTANT VARCHAR2(128) := 'PCARDIMPBO';
     c_schema_b   CONSTANT VARCHAR2(128) := 'PCARDIMPFE';
 
     -- Profil de synchronisation appliqué aux tables de la liste :
-    c_direction  CONSTANT VARCHAR2(20)  := 'A_TO_B';        -- A_TO_B / B_TO_A / BIDIRECTIONAL
-    c_mode       CONSTANT VARCHAR2(20)  := 'INSERT_UPDATE'; -- INSERT / UPDATE / INSERT_UPDATE
+    c_direction  CONSTANT VARCHAR2(20)  := 'BIDIRECTIONAL';        -- A_TO_B / B_TO_A / BIDIRECTIONAL
+    c_mode       CONSTANT VARCHAR2(20)  := 'INSERT'; -- INSERT / UPDATE / INSERT_UPDATE
     c_conflits   CONSTANT VARCHAR2(20)  := 'ERROR_ON_CONFLICT'; -- SOURCE_A_WINS / SOURCE_B_WINS / ERROR_ON_CONFLICT
-    c_priorite   CONSTANT NUMBER        := 100;
+    c_priorite   CONSTANT NUMBER        := 10;
 
     -- 'Y' = DRY RUN SEUL (rien sur les tables métier) ;
     -- 'N' = dry run PUIS run réel (à passer après avoir validé le dry).

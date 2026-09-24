@@ -560,6 +560,94 @@ Pièges v1 :
   pic, et suivre l'avancement via `GET_STATS_JOB_STATUS`.
 
 --------------------------------------------------------------------------------
+## 11. Synchro niveau schéma — `schema-sync` (patch & run)
+
+Chaîne la v6 (détermination des écarts par stats) avec le run de synchro pour
+**réaligner la volumétrie à l'échelle du schéma** : les tables communes des
+deux côtés sont comparées sur `NUM_ROWS` ; les tables en écart sont ensuite
+synchronisées (dry run systématique, run réel uniquement sur flag explicite).
+
+### 11.1 Principe
+
+- **Périmètre** : tables de base *communes* aux deux schémas (ce que mesure
+  `REPORT_COUNTS_GAP`, §10).
+- **Tables en écart** : `DIFF` signé (`NUM_ROWS_B - NUM_ROWS_A`), triées par
+  `|DIFF|` décroissant ; `+` = B a plus de lignes que A.
+- **Tables `NO_STATS_*`** : *exclues de la synchro* (stats absentes d'un côté
+  au moins : impossible de juger), comptées et signalées.
+- **Profil appliqué aux tables en écart** (défauts, décision utilisateur) :
+  direction **BIDIRECTIONAL** (chaque côté reçoit les lignes qui lui
+  manquent), mode **INSERT** seul (aucune valeur existante n'est écrasée),
+  conflits **ERROR_ON_CONFLICT** (tableau signalé, non réparé), priorité
+  **10**, exclusions d'audit standard
+  (`DATE_CREATE, DATE_MODIF, USER_MODIF, DATE_CREATION, CREATED_DATE,
+  UPDATED_DATE`).
+- **Patch & run** : l'exécution entière se fait sous *patch temporaire* des
+  constantes `C_SCHEMA_A/B` (Annexe C) ; le package est **restauré
+  systématiquement** en mode test à la fin, y compris en cas d'erreur.
+
+### 11.2 Commande
+
+```bash
+python setup_project.py schema-sync --schema-a PCARDIMPBO --schema-b PCARDIMPFE [options]
+```
+
+| Option | Rôle (défaut) |
+|--------|---------------|
+| `--direction D` | sens de synchro appliqué aux tables en écart (`BIDIRECTIONAL`) |
+| `--sync-mode M` | mode de synchro (`INSERT`) |
+| `--conflicts C` | stratégie de conflit (`ERROR_ON_CONFLICT`) |
+| `--priority N` | priorité des tables en écart (10) |
+| `--exclusions "c1,c2"` | colonnes d'audit exclues (liste standard) |
+| `--collect` | relancer la collecte des stats par jobs (défaut : stats courantes) |
+| `--max-age-hours N` | refuser le rapport si les stats d'un côté sont plus vieilles que N h |
+| `--wait-timeout S` | attente maxi des jobs de collecte (3600) |
+| `--max-tables N` | limite le nombre de tables synchronisées (toutes) |
+| `--min-diff-pct P` | seuil minimal de `DIFF_PCT` (aucun) |
+| `--real` | exécute aussi le run réel (dry run seul par défaut) |
+
+Règle opérationnelle : **dry run d'abord, `--real` ensuite** — jamais de run
+réel sans validation préalable du dry run (le dry run donne les comptes
+exacts par clé).
+
+### 11.3 Déroulé et lecture
+
+1. **Patch temporaire** (Annexe C) : constantes `C_SCHEMA_A/B` = cibles ;
+2. (option) **collecte des stats** (§10.1) si `--collect` ;
+3. **`REPORT_COUNTS_GAP`** → `gap_id`, périmètre (tables communes / à parité /
+   en écart / `NO_STATS_*`), liste des écarts triés ;
+4. **config idempotente** des tables en écart (`INSERT ... NOT EXISTS` :
+   l'existant n'est *jamais* écrasé — les tables déjà configurées conservent
+   leur direction/mode et sont signalées comme `CONFIG ... conservées`) +
+   exclusions d'audit présentes côté A ;
+5. **`SYNC_TABLES` en dry run** → `run_id` + bilan + détail par table
+   (`INS->B`, `INS->A`, `UPD->B`, `UPD->A`, `conf`, `err`, `statut`) ;
+6. (si `--real`) **`SYNC_TABLES` réel** → `run_id` + bilan + détail ;
+7. **restauration** systématique du package (mode test).
+
+Bilan d'un run : `status` (`SUCCESS` / `SUCCESS_WITH_CONFLICTS` / `PARTIAL` /
+`FAILED`), `total`, `succ`, `conf`, `fail`, `excl` — compléter par les
+vérifications du §6 et le détail `SYNC_LOG` du `run_id`.
+
+**Limites assumées (documentées au §10)** : `NUM_ROWS` est une *estimation* de
+l'optimiseur — une table listée peut en réalité être à parité (faux positif) ;
+le dry run fournit les **comptes exacts** (comparaison par clé) et sert de
+seconde vérification avant `--real`. Les conflits sont signalés, pas réparés :
+pour ré-aligner des *valeurs*, utiliser le script 12 sur une liste ciblée.
+Sans filtre, **toutes** les tables en écart sont synchronisées (ex. réel : 229
+tables) — dry run potentiellement long : utiliser `--max-tables` / 
+`--min-diff-pct` au besoin. `--collect` reste lourd sur un gros schéma.
+
+**Ré-audit post-run d'un rapport** :
+
+```sql
+SELECT table_name, num_rows_a, num_rows_b, diff, diff_pct, gap_flag
+  FROM sync_stats_gap_detail
+ WHERE gap_id = :gap_id
+ ORDER BY ABS(diff) DESC;
+```
+
+--------------------------------------------------------------------------------
 ## Annexe A — Rappel de l'API publique (`03_sync_package_spec.sql`)
 
 | Procédure / fonction | Rôle |
@@ -593,7 +681,7 @@ Pièges v1 :
 | `13_RESET_CONFIG_HISTORIQUE.sql` | **remise à zéro** config + historique + séquences (§8.2, `SYNC_RUN_OPTION` conservée) |
 | `14_sync_stats_gap_tables.sql` | **v6** : tables `SYNC_STATS_GAP(_DETAIL)` + 2 séquences (§10) |
 | `15_sys_stats_gap_grants.sql` | **v6** : grants SYS de l'état d'écart (`ANALYZE ANY`, `CREATE JOB`, …) |
-| `tools/orasync/` | CLI `setup_project.py` (`check`, `install`, `migrate`, `sql`, `sample`, `test`, `status`, `gap`) |
+| `tools/orasync/` | CLI `setup_project.py` (`check`, `install`, `migrate`, `sql`, `sample`, `test`, `status`, `gap`, `schema-sync`) |
 
 ## Annexe C — Patch temporaire des constantes `C_SCHEMA_A/B` (schémas ≠ compilés)
 

@@ -37,6 +37,12 @@ Architecture générique, bidirectionnelle, idempotente, configurable, auditable
 > des statistiques Oracle (collecte explicite en amont), utiliser
 > `python setup_project.py gap --schema-a <A> --schema-b <B>` (voir
 > [§12 Changelog v6](#12-changelog-v6)).
+>
+> **Synchro niveau schéma (v6.1)** : pour *réaligner* la volumétrie des tables
+> en écart (dry run d'abord, réel avec `--real`), utiliser
+> `python setup_project.py schema-sync --schema-a <A> --schema-b <B>` (voir
+> [§12.6](#126-synchro-niveau-schéma--schema-sync) et la
+> [procédure §11](11_PROCEDURE_SYNCHRONISATION.md)).
 
 ---
 
@@ -532,6 +538,7 @@ Le premier appel crée `.venv/`, installe `oracledb` et se ré-exécute automati
 | `sql 15_sys_stats_gap_grants.sql --profile sys` | Octroi idempotent des privilèges SYS de l'état d'écart v6 (une fois, avant le premier `gap`) | `sys` |
 | `status [--limit N]` | Affiche les dernières exécutions (`SYNC_RUN_HEADER`) | `admin` |
 | `gap [--schema-a A] [--schema-b B] [--max-age-hours N] [--no-collect] [--wait-timeout S] [--limit N]` | État d'écart des comptes de lignes A/B (stats Oracle) : collecte asynchrone des stats (sauf `--no-collect`), attente de fin, génération du rapport persistant puis affichage trié par écart décroissant | `admin` |
+| `schema-sync [--schema-a A] [--schema-b B] [--direction D] [--sync-mode M] [--conflicts C] [--priority N] [--exclusions "c1,c2"] [--collect] [--max-age-hours N] [--wait-timeout S] [--max-tables N] [--min-diff-pct P] [--real]` | **Synchro niveau schéma** : tables en écart détectées par stats (v6), config idempotente des tables en écart puis `SYNC_TABLES` — dry run systématique, run réel uniquement avec `--real` ; patch temporaire des constantes `C_SCHEMA_A/B` avec restauration garantie | `admin` |
 
 Options globales : `--env-file`, `-v`/`-vv` (verbosité), `--dry-run` (affiche les actions sans exécuter les scripts).
 
@@ -605,3 +612,25 @@ PKG_SCHEMA_SYNC.GET_LAST_GAP_ID()                         RETURN NUMBER;
 - **Harnais 07 étendu** : Bloc 11 (v6) — collecte réelle par jobs sur les schémas de test, attente asynchrone, génération et re-consultation du rapport (`GET_LAST_GAP_ID`), garde de fraîcheur (`-20013`), détection `NO_STATS_A` après purge ciblée des stats, restauration des stats — **86 assertions** au total (72 + 14).
 - **CLI** : commande `gap` — `python setup_project.py gap --schema-a A --schema-b B [--max-age-hours N] [--no-collect] [--wait-timeout S] [--limit N]`.
 - **Limites v1 assumées** : `NUM_ROWS` estimé (pas `COUNT(*)`) ; collecte distante non supportée ; la fraîcheur n'est contrôlée que si `p_max_age_hours` est fourni (sinon l'opérateur s'appuie sur `STATS_DATE_A/B` de l'en-tête).
+
+### 12.6. Synchro niveau schéma — `schema-sync`
+
+Chaîne la v6 (écarts par stats) avec le run de synchro pour **réaligner la
+volumétrie à l'échelle du schéma** :
+
+- **Périmètre** : tables communes aux deux schémas ; tables en écart = `DIFF`
+  signé (`NUM_ROWS_B - NUM_ROWS_A ≠ 0`) ; `NO_STATS_*` exclus de la synchro
+  mais comptés/signalés.
+- **Profil des tables en écart** (défauts) : `BIDIRECTIONAL` / `INSERT` seul /
+  `ERROR_ON_CONFLICT` / priorité 10 / exclusions d'audit standard.
+- **Déroulé** : patch temporaire des constantes `C_SCHEMA_A/B` (Annexe C) →
+  stats courantes (ou `--collect` par jobs) → `REPORT_COUNTS_GAP` → filtres
+  optionnels (`--max-tables`, `--min-diff-pct`) → config idempotente
+  (`NOT EXISTS`, l'existant n'est jamais écrasé) → `SYNC_TABLES` **dry run
+  systématique** → run réel **uniquement** avec `--real` → restauration
+  garantie du package (mode test) en `finally`.
+- **CLI** : `python setup_project.py schema-sync --schema-a A --schema-b B [--direction BIDIRECTIONAL] [--sync-mode INSERT] [--conflicts ERROR_ON_CONFLICT] [--priority 10] [--exclusions "..."] [--collect] [--max-age-hours N] [--wait-timeout S] [--max-tables N] [--min-diff-pct P] [--real]`.
+- **Lecture** : bilan par run (`status`, `total`, `succ`, `conf`, `fail`,
+  `excl` dans `SYNC_RUN_HEADER`) et détail par table (`INS->B`, `INS->A`,
+  `UPD->B`, `UPD->A`, `conf`, `err`, `statut` dans `SYNC_LOG`) ; procédure
+  complète au §11 de `11_PROCEDURE_SYNCHRONISATION.md`.

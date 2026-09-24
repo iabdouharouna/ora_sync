@@ -18,6 +18,7 @@ from .project import (
     run_sample,
     run_sql_file,
 )
+from .schema_sync import DEFAULT_EXCLUSIONS, schema_sync
 
 PROG = "setup_project.py"
 
@@ -34,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
             f"  python {PROG} test\n"
             f"  python {PROG} sql 09_test_sync_mode.sql\n"
             f"  python {PROG} gap --schema-a PCARDIMPBO --schema-b PCARDIMPFE\n"
+            f"  python {PROG} schema-sync --schema-a PCARDIMPBO --schema-b PCARDIMPFE\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"ora_sync {__version__}")
@@ -130,6 +132,82 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="nombre de lignes de detail affichees (defaut : 50)",
+    )
+
+    schema_sync = sub.add_parser(
+        "schema-sync",
+        help="synchro niveau schema: tables en ecart (stats) puis sync dry/reel",
+        parents=[common],
+    )
+    schema_sync.add_argument(
+        "--schema-a",
+        required=True,
+        help="schema cote A (tables en ecart determinees par stats)",
+    )
+    schema_sync.add_argument(
+        "--schema-b",
+        required=True,
+        help="schema cote B",
+    )
+    schema_sync.add_argument(
+        "--direction",
+        default="BIDIRECTIONAL",
+        help="sens de synchro applique aux tables en ecart (defaut : BIDIRECTIONAL)",
+    )
+    schema_sync.add_argument(
+        "--sync-mode",
+        default="INSERT",
+        help="mode de synchro (defaut : INSERT)",
+    )
+    schema_sync.add_argument(
+        "--conflicts",
+        default="ERROR_ON_CONFLICT",
+        help="strategie de conflit (defaut : ERROR_ON_CONFLICT)",
+    )
+    schema_sync.add_argument(
+        "--priority",
+        type=int,
+        default=10,
+        help="priorite des tables en ecart (defaut : 10)",
+    )
+    schema_sync.add_argument(
+        "--exclusions",
+        default=None,
+        help="colonnes d'audit exclues (defaut : liste standard)",
+    )
+    schema_sync.add_argument(
+        "--collect",
+        action="store_true",
+        help="relancer la collecte des stats par jobs (defaut : stats courantes)",
+    )
+    schema_sync.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=None,
+        help="fraichueur maxi des stats en heures (defaut : sans controle)",
+    )
+    schema_sync.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=3600,
+        help="attente maximale des jobs de collecte en secondes (defaut : 3600)",
+    )
+    schema_sync.add_argument(
+        "--max-tables",
+        type=int,
+        default=None,
+        help="nombre maximal de tables synchronisees (defaut : toutes)",
+    )
+    schema_sync.add_argument(
+        "--min-diff-pct",
+        type=float,
+        default=None,
+        help="seuil minimal de DIFF_PCT pour retenir une table",
+    )
+    schema_sync.add_argument(
+        "--real",
+        action="store_true",
+        help="executer aussi le run reel (dry run seul par defaut)",
     )
 
     setup = sub.add_parser(
@@ -281,6 +359,166 @@ def _cmd_gap(args, settings) -> int:
     return 0
 
 
+def _print_gap_tables(rows: list[dict], limit: int) -> None:
+    """Affiche la liste des tables en écart (tri |DIFF| décroissant)."""
+    displayed = rows[: max(limit, 0)]
+    headings = ["table", "A", "B", "DIFF", "DIFF%"]
+    data = [
+        [
+            str(row["table_name"]),
+            "-" if row["num_rows_a"] is None else str(row["num_rows_a"]),
+            "-" if row["num_rows_b"] is None else str(row["num_rows_b"]),
+            "-" if row["diff"] is None else _fmt_signed(row["diff"]),
+            "-" if row["diff_pct"] is None else str(row["diff_pct"]),
+        ]
+        for row in displayed
+    ]
+    widths = [len(head) for head in headings]
+    for line in data:
+        for index, value in enumerate(line):
+            widths[index] = max(widths[index], len(value))
+    print("  " + " | ".join(head.ljust(widths[i]) for i, head in enumerate(headings)))
+    print("  " + "-+-".join("-" * width for width in widths))
+    for line in data:
+        print("  " + " | ".join(value.ljust(widths[i]) for i, value in enumerate(line)))
+    if len(rows) > len(displayed):
+        print(f"  ... ({len(rows) - len(displayed)} table(s) en plus : "
+              "revoir avec --max-tables ou les filtres)")
+
+
+def _print_run_detail(label: str, rows: list[dict]) -> None:
+    """Détail par table d'un run (SYNC_LOG)."""
+    if not rows:
+        print(f"  {label:8s}: aucune ligne de log (run vide ou interrompu)")
+        return
+    headings = ["table", "INS->B", "INS->A", "UPD->B", "UPD->A", "conf", "err", "statut"]
+    data = [
+        [
+            str(row["table_name"]),
+            str(row["rows_inserted_a_to_b"]),
+            str(row["rows_inserted_b_to_a"]),
+            str(row["rows_updated_a_to_b"]),
+            str(row["rows_updated_b_to_a"]),
+            str(row["conflict_count"]),
+            str(row["error_count"]),
+            str(row["status"]),
+        ]
+        for row in rows
+    ]
+    widths = [len(head) for head in headings]
+    for line in data:
+        for index, value in enumerate(line):
+            widths[index] = max(widths[index], len(value))
+    print(f"  {label:8s}: " + " | ".join(head.ljust(widths[i]) for i, head in enumerate(headings)))
+    print("           " + "-+-".join("-" * width for width in widths))
+    for line in data:
+        print(f"  {label:8s}: " + " | ".join(value.ljust(widths[i]) for i, value in enumerate(line)))
+
+
+def _fmt_run_summary(header: dict | None) -> str:
+    """Bilan court d'un run (SYNC_RUN_HEADER)."""
+    if header is None:
+        return "introuvable"
+    return (
+        "status={status} total={total} succ={success} conf={conflict} "
+        "fail={failed} excl={excluded}".format(
+            status=header.get("status"),
+            total=header.get("total_tables"),
+            success=header.get("tables_success"),
+            conflict=header.get("tables_conflict"),
+            failed=header.get("tables_failed"),
+            excluded=header.get("tables_excluded"),
+        )
+    )
+
+
+def _cmd_schema_sync(args, settings) -> int:
+    result = schema_sync(
+        settings,
+        schema_a=args.schema_a,
+        schema_b=args.schema_b,
+        direction=args.direction,
+        sync_mode=args.sync_mode,
+        conflicts=args.conflicts,
+        priority=args.priority,
+        exclusions=args.exclusions or DEFAULT_EXCLUSIONS,
+        collect=args.collect,
+        max_age_hours=args.max_age_hours,
+        wait_timeout=args.wait_timeout,
+        max_tables=args.max_tables,
+        min_diff_pct=args.min_diff_pct,
+        real=args.real,
+    )
+    header = result.header or {}
+
+    print("Synchro niveau schema (ecarts par stats Oracle, patch & run)")
+    print(f"  schemas   : A={args.schema_a}  B={args.schema_b}")
+    print(f"  rapport   : gap_id={result.gap_id}")
+    if result.jobs:
+        print(f"  collecte  : {' / '.join(result.jobs)} (reussie)")
+    else:
+        print("  collecte  : stats courantes (--collect pour relancer par jobs)")
+    print(
+        "  stats     : A={a}  B={b}".format(
+            a=header.get("stats_date_a") or "n/d",
+            b=header.get("stats_date_b") or "n/d",
+        )
+    )
+    print(
+        "  perimetre : {total} tables communes - {ok} a parite - {gap} en ecart "
+        "(NO_STATS_A={nsa}, NO_STATS_B={nsb})".format(
+            total=header.get("total_tables"),
+            ok=header.get("tables_ok"),
+            gap=header.get("tables_gap"),
+            nsa=header.get("tables_no_stats_a"),
+            nsb=header.get("tables_no_stats_b"),
+        )
+    )
+    print("  DIFF      : B - A (signe + : B a plus de lignes que A)")
+    print(
+        f"  profil    : {args.direction} / {args.sync_mode} / {args.conflicts} "
+        f"/ priorite {args.priority}"
+    )
+
+    if result.no_stats:
+        print(
+            f"  NO_STATS  : {len(result.no_stats)} table(s) exclue(s) de la "
+            "synchro (stats absentes - impossible de juger)"
+        )
+
+    if not result.gap_tables:
+        print("  synchro   : aucune table en ecart DIFF - rien a synchroniser")
+        return 0
+
+    extra = ""
+    if args.max_tables is not None or args.min_diff_pct is not None:
+        extra = f" (filtre : {len(result.gap_tables)}/{header.get('tables_gap')} retenues)"
+    print(f"  synchro   : {len(result.gap_tables)} table(s) en ecart{extra}")
+    _print_gap_tables(result.gap_tables, limit=50)
+
+    if result.config_kept:
+        print(
+            f"  CONFIG    : {len(result.config_kept)} table(s) deja configuree(s) "
+            "- direction/mode existants conserves (ex: "
+            + ", ".join(result.config_kept[:5])
+            + ("..." if len(result.config_kept) > 5 else "")
+            + ")"
+        )
+
+    print(f"  dry run   : run_id={result.dry_run_id}  {_fmt_run_summary(result.dry_header)}")
+    _print_run_detail("dry", result.dry_rows)
+
+    if result.real_run_id is not None:
+        print(
+            f"  run reel  : run_id={result.real_run_id}  "
+            f"{_fmt_run_summary(result.real_header)}"
+        )
+        _print_run_detail("reel", result.real_rows)
+    else:
+        print("  run reel  : NON EXECUTE (relancer avec --real apres validation du dry run)")
+    return 0
+
+
 def _cmd_status(args, settings) -> int:
     rows = fetch_status(settings, limit=args.limit)
     if not rows:
@@ -319,6 +557,7 @@ _HANDLERS = {
     "sql": _cmd_sql,
     "status": _cmd_status,
     "gap": _cmd_gap,
+    "schema-sync": _cmd_schema_sync,
     "setup": _cmd_setup,
 }
 
