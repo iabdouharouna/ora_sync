@@ -16,10 +16,19 @@ Profil par défaut (décision utilisateur) : direction BIDIRECTIONAL (chaque
 côté reçoit les lignes qui lui manquent), mode INSERT seul (aucune valeur
 existante n'est écrasée), conflits ERROR_ON_CONFLICT (tableau signalé, non
 réparé), priorité 10, exclusions d'audit standard.
+
+Filtre optionnel : `exclude_tables` (motifs `%`/`_` séparés par virgules,
+comparés sur le nom en MAJUSCULES) retire du périmètre les tables
+volumineuses qu'on ne veut pas synchroniser (ex. `AUTHO%,TRANSACTION%,%LOG%`),
+et `max_table_rows` (seuil entier) exclut toute table dont le volume
+`GREATEST(NUM_ROWS_A, NUM_ROWS_B)` dépasse le seuil (le hachage des clés
+d'une grosse table pèse très lourd sur le dry run). Les deux filtres
+s'appliquent avant l'application de `max_tables`/`min_diff_pct`.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -319,6 +328,8 @@ def schema_sync(
     wait_timeout: int = 3600,
     max_tables: int | None = None,
     min_diff_pct: float | None = None,
+    exclude_tables: str | None = None,
+    max_table_rows: int | None = None,
     real: bool = False,
 ) -> SchemaSyncResult:
     """Patch & run d'une synchro niveau schéma (voir docstring du module).
@@ -368,6 +379,51 @@ def schema_sync(
             ]
             # Tri |DIFF| décroissant puis filtres optionnels.
             diff.sort(key=lambda row: abs(row["diff"] or 0), reverse=True)
+            # Exclusion par masque de nom (tables volumineuses, ex. journaux).
+            # Syntaxe à la SQL LIKE (% et _), traduite en glob fnmatch (* et ?).
+            if exclude_tables:
+                patterns = [
+                    p.strip().upper().replace("%", "*").replace("_", "?")
+                    for p in exclude_tables.split(",")
+                    if p.strip()
+                ]
+                kept, skipped = [], []
+                for row in diff:
+                    name = str(row["table_name"]).upper()
+                    if any(fnmatch.fnmatchcase(name, pat) for pat in patterns):
+                        skipped.append(name)
+                    else:
+                        kept.append(row)
+                diff = kept
+                if skipped:
+                    print(
+                        f"  EXCLU    : {len(skipped)} table(s) masquees par "
+                        f"--exclude-tables (ex. "
+                        + ", ".join(skipped[:8])
+                        + ("..." if len(skipped) > 8 else "")
+                        + ")"
+                    )
+            # Exclusion par volumétrie --max-table-rows (tables trop lourdes
+            # pour le hachage/clé du dry run, ex. > 500 000 lignes).
+            if max_table_rows is not None:
+                vol = max(max_table_rows, 0)
+                kept, skipped = [], []
+                for row in diff:
+                    volume = max(
+                        row["num_rows_a"] or 0, row["num_rows_b"] or 0
+                    )
+                    if volume > vol:
+                        skipped.append((row["table_name"], volume))
+                    else:
+                        kept.append(row)
+                diff = kept
+                if skipped:
+                    print(
+                        f"  EXCLU    : {len(skipped)} table(s) au dela de "
+                        f"{vol:,} lignes (--max-table-rows), ex. "
+                        + ", ".join(f"{n} ({v:,})" for n, v in skipped[:8])
+                        + ("..." if len(skipped) > 8 else "")
+                    )
             if min_diff_pct is not None:
                 diff = [
                     row

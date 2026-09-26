@@ -2845,11 +2845,17 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
         v_columns   t_column_tab;
         v_types     t_coltype_tab;
         v_table     VARCHAR2(128)  := sanitize_ident(p_table_name);
-        v_jo_cols   VARCHAR2(32000);
+        -- Buffers en CLOB : le JSON_OBJECT sérialisant TOUTES les colonnes
+        -- non-LOB peut dépasser 4 000 (limite de la forme VARCHAR2, ORA-40478
+        -- observé sur CARD / CR_PROFILE / TERMINAL_POS_WATCH_ACTIVITY) et la
+        -- requête entière 32 000 (ORA-06502 observé sur SHADOW_ACCOUNT,
+        -- 350 colonnes). RETURNING CLOB + EXECUTE IMMEDIATE sur CLOB lèvent
+        -- ces plafonds (documenté Oracle 23 ; SQL natif ≥ 12c).
+        v_jo_cols   CLOB;
         v_sel_disp  VARCHAR2(32000);
-        v_json_expr VARCHAR2(32000) := 'NULL';
+        v_json_expr CLOB := empty_clob();
         v_hkey      VARCHAR2(32000);
-        v_sql       VARCHAR2(32000);
+        v_sql       CLOB;
         v_b_ref     VARCHAR2(300);
     BEGIN
         v_columns := get_sync_columns(p_table_name, p_key_cols);
@@ -2867,17 +2873,29 @@ CREATE OR REPLACE PACKAGE BODY PKG_SCHEMA_SYNC AS
             END IF;
         END LOOP;
         IF v_jo_cols IS NOT NULL THEN
-            v_json_expr := 'JSON_OBJECT(' || v_jo_cols || ')';
+            -- RETURNING CLOB : sans cette clause, JSON_OBJECT est borné à
+            -- VARCHAR2(4000) et lève ORA-40478 dès que la ligne sérialisée
+            -- dépasse 4 000 caractères (tables à 150-200+ colonnes).
+            v_json_expr := 'JSON_OBJECT(' || v_jo_cols || ' RETURNING CLOB)';
+        ELSE
+            v_json_expr := 'NULL';
         END IF;
 
         -- Représentation lisible "CLIENT_ID=10, ..." (fallback : hash brut si
         -- ligne absente côté A — ne devrait pas arriver pour un conflit, dont
-        -- la clé existe des deux côtés par construction).
+        -- la clé existe des deux côtés par construction). Chaque valeur est
+        -- bornée à 200 caractères et l'ensemble à 4 000 (cible PK_DISPLAY
+        -- VARCHAR2(4000)) : une clé CLOB ou très longue ne doit jamais
+        -- faire échouer le diagnostic (ORA-40478 / ORA-12899).
         FOR i IN 1 .. p_key_cols.COUNT LOOP
             v_sel_disp := v_sel_disp
                 || CASE WHEN i > 1 THEN ' || '', '' || ' END
-                || sql_literal(p_key_cols(i) || '=') || ' || TO_CHAR(' || sanitize_ident(p_key_cols(i)) || ')';
+                || sql_literal(p_key_cols(i) || '=') || ' || SUBSTR(TO_CHAR('
+                || sanitize_ident(p_key_cols(i)) || '), 1, 200)';
         END LOOP;
+        IF v_sel_disp IS NOT NULL THEN
+            v_sel_disp := 'SUBSTR(' || v_sel_disp || ', 1, 4000)';
+        END IF;
 
         v_b_ref := b_table_ref(p_table_name);
 

@@ -205,6 +205,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="seuil minimal de DIFF_PCT pour retenir une table",
     )
     schema_sync.add_argument(
+        "--exclude-tables",
+        default=None,
+        help="masques de noms de tables a exclure, separes par des virgules "
+        "(wildcards %% et _ ; appliques en MAJUSCULES, ex. AUTHO%%,%%LOG%%)",
+    )
+    schema_sync.add_argument(
+        "--max-table-rows",
+        type=int,
+        default=None,
+        help="seuil de volumetrie : exclut toute table dont le volume "
+        "GREATEST(NUM_ROWS_A, NUM_ROWS_B) depasse N lignes "
+        "(ex. 500000 pour ecarter les tables trop lourdes pour le dry run)",
+    )
+    schema_sync.add_argument(
         "--real",
         action="store_true",
         help="executer aussi le run reel (dry run seul par defaut)",
@@ -447,6 +461,8 @@ def _cmd_schema_sync(args, settings) -> int:
         wait_timeout=args.wait_timeout,
         max_tables=args.max_tables,
         min_diff_pct=args.min_diff_pct,
+        exclude_tables=args.exclude_tables,
+        max_table_rows=args.max_table_rows,
         real=args.real,
     )
     header = result.header or {}
@@ -491,7 +507,12 @@ def _cmd_schema_sync(args, settings) -> int:
         return 0
 
     extra = ""
-    if args.max_tables is not None or args.min_diff_pct is not None:
+    if (
+        args.max_tables is not None
+        or args.min_diff_pct is not None
+        or args.exclude_tables is not None
+        or args.max_table_rows is not None
+    ):
         extra = f" (filtre : {len(result.gap_tables)}/{header.get('tables_gap')} retenues)"
     print(f"  synchro   : {len(result.gap_tables)} table(s) en ecart{extra}")
     _print_gap_tables(result.gap_tables, limit=50)

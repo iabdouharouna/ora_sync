@@ -604,6 +604,8 @@ python setup_project.py schema-sync --schema-a PCARDIMPBO --schema-b PCARDIMPFE 
 | `--wait-timeout S` | attente maxi des jobs de collecte (3600) |
 | `--max-tables N` | limite le nombre de tables synchronisées (toutes) |
 | `--min-diff-pct P` | seuil minimal de `DIFF_PCT` (aucun) |
+| `--exclude-tables "masques"` | exclut les tables dont le nom (en MAJUSCULES) matche un masque `%`/`_` séparé par virgule, ex. `AUTHO%,TRANSACTION%,%LOG%` pour écarter les gros journaux (aucun) |
+| `--max-table-rows N` | exclut toute table dont le volume `GREATEST(NUM_ROWS_A, NUM_ROWS_B)` dépasse N lignes : le hachage de clés des très grosses tables pèse très lourd sur le dry run, ce seuil les écarte du périmètre (aucun) |
 | `--real` | exécute aussi le run réel (dry run seul par défaut) |
 
 Règle opérationnelle : **dry run d'abord, `--real` ensuite** — jamais de run
